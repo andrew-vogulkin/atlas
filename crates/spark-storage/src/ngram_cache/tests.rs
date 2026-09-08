@@ -213,3 +213,47 @@ fn multi_file_rows_are_byte_identical() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The row whose 4 KiB block runs past the end of the shard file — a table
+/// that ends mid-block inside a safetensors shard. Seen live on
+/// Qwen3.8-Flash-Next (2026-09-08): `decode_batch error: NgramRowCache: read
+/// row 250001192: positional read hit EOF after 1659 of 4096 bytes`. The
+/// fault path must accept the short final block as long as it covers the row.
+///
+/// Ignored by default (pinned arena needs a CUDA context):
+///
+///     cargo test -p spark-storage --features cuda short_final_block -- --ignored
+#[test]
+#[ignore]
+fn last_row_in_a_short_final_block_is_readable() {
+    use std::io::Write;
+
+    const STRIDE: usize = 160;
+    const ROWS: u64 = 30; // 8 + 30*160 = 4808 bytes: the last row's block ends at 8192, the file at 4808
+    let dir = std::env::temp_dir().join(format!("ngram_short_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("tmpdir");
+    let path = dir.join("shard.bin");
+    let mut fh = std::fs::File::create(&path).expect("create");
+    fh.write_all(&[0u8; 8]).expect("lead");
+    for local in 0..ROWS {
+        fh.write_all(&[(local as u8).wrapping_mul(13).wrapping_add(1); STRIDE])
+            .expect("row");
+    }
+    drop(fh);
+    assert!(!std::fs::metadata(&path).unwrap().len().is_multiple_of(4096));
+
+    let shards = vec![(path.clone(), 8u64)];
+    let mut cache =
+        NgramRowCache::open_segmented(&shards, ROWS, None, STRIDE, 64).expect("segmented cache");
+    let probes = vec![0u64, ROWS - 2, ROWS - 1];
+    let mut slots = Vec::new();
+    cache
+        .resolve(&probes, &mut slots)
+        .expect("the short final block must not be an EOF error");
+    for (probe, slot) in probes.iter().zip(&slots) {
+        let got = cache.slot_bytes(*slot).expect("slot bytes");
+        let want = [(*probe as u8).wrapping_mul(13).wrapping_add(1); STRIDE];
+        assert_eq!(got, &want[..], "row {probe} came back with the wrong bytes");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

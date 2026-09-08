@@ -107,8 +107,18 @@ pub(super) fn fetch_row(
     } else {
         1
     };
-    atlas_tier::pio::read_exact_at(file, bounce.blocks(nblocks), block_off)
+    // The last block of a shard may be shorter than BLOCK (the table ends
+    // mid-block inside the safetensors file), so a short read is fine as long
+    // as it covers the row; only a read that stops INSIDE the row is EOF.
+    let need = within + src.row_stride;
+    let got = atlas_tier::pio::read_up_to_at(file, bounce.blocks(nblocks), block_off)
         .with_context(|| format!("NgramRowCache: read row {id}"))?;
+    if got < need {
+        anyhow::bail!(
+            "NgramRowCache: read row {id}: EOF after {got} of the {need} bytes the row needs \
+             at offset {block_off}"
+        );
+    }
     // SAFETY: slot is one this batch pinned, so it is < slots and no other
     // worker writes it; the arena holds slots*row_stride bytes.
     let dst = unsafe {
@@ -125,8 +135,13 @@ pub(super) fn fetch_row(
         let sbyte = id * 4;
         let sblock = sbyte - (sbyte % BLOCK as u64);
         let swithin = (sbyte - sblock) as usize;
-        atlas_tier::pio::read_exact_at(sfile, bounce.blocks(1), sblock)
+        let sgot = atlas_tier::pio::read_up_to_at(sfile, bounce.blocks(1), sblock)
             .with_context(|| format!("NgramRowCache: read scale {id}"))?;
+        if sgot < swithin + 4 {
+            anyhow::bail!(
+                "NgramRowCache: read scale {id}: EOF after {sgot} bytes at offset {sblock}"
+            );
+        }
         // SAFETY: as above; the scale arena holds slots*4 bytes.
         let sdst = unsafe { std::slice::from_raw_parts_mut(sbase.add(slot as usize * 4), 4) };
         sdst.copy_from_slice(&bounce.blocks(1)[swithin..swithin + 4]);
