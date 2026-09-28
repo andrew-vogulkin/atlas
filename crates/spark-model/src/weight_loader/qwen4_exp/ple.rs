@@ -93,7 +93,6 @@ fn slots_from_env(scratch_tokens: usize, ngram_heads: usize) -> (usize, &'static
 /// First uploaded name that exists. EXL3 checkpoints use the nested
 /// `ngram_embedding.*` names; RadixArk NVFP4 still ships the old
 /// `ple_embedding.*` names. Missing both is the caller's error.
-#[cfg(feature = "cuda")]
 fn first_present<'a>(store: &WeightStore, names: &[&'a str]) -> Option<&'a str> {
     names.iter().copied().find(|n| store.get(n).is_ok())
 }
@@ -101,7 +100,6 @@ fn first_present<'a>(store: &WeightStore, names: &[&'a str]) -> Option<&'a str> 
 /// EXL3 name first (`ngram_embedding.{exl3}`), then the NVFP4 name
 /// (`{nvfp4}` directly under `ple_embedding`). If neither is uploaded, return
 /// the EXL3 name so `i64_host` reports that miss.
-#[cfg(feature = "cuda")]
 fn ple_i64_name(store: &WeightStore, lp: &str, exl3: &str, nvfp4: &str) -> String {
     let nested = format!("{lp}.ple_embedding.ngram_embedding.{exl3}");
     let flat = format!("{lp}.ple_embedding.{nvfp4}");
@@ -177,6 +175,21 @@ fn fp16_host(store: &WeightStore, name: &str, n: usize, gpu: &dyn GpuBackend) ->
         .chunks_exact(2)
         .map(|b| u16::from_le_bytes([b[0], b[1]]))
         .collect())
+}
+
+
+/// Single trellis if no `shard_0` is deferred, else `None` (segmented open).
+fn ngram_table_open<'a>(
+    store: &'a WeightStore,
+    lp: &str,
+) -> Option<&'a spark_runtime::weights::DeferredTensor> {
+    let shard0 = format!("{lp}.ple_embedding.ngram_embedding.shard_0");
+    if store.deferred(&format!("{shard0}.weight")).is_some()
+        || store.deferred(&format!("{shard0}.trellis")).is_some()
+    {
+        return None;
+    }
+    store.deferred(&format!("{lp}.ple_embedding.ngram_embedding.trellis"))
 }
 
 /// Build the PLE layer for `layer_idx`, or `None` if this model has none.
@@ -277,11 +290,11 @@ pub(super) fn load(
     // open_at reads it at the safetensors data offset. Sharded tables stay
     // on open_segmented below.
     let single_name = format!("{lp}.ple_embedding.ngram_embedding.trellis");
-    let single = if shards.is_empty() {
-        store.deferred(&single_name)
-    } else {
-        None
-    };
+    let single = ngram_table_open(store, &lp);
+    anyhow::ensure!(
+        shards.is_empty() || single.is_none(),
+        "PLE: shard tables and a single `{single_name}` must not both be deferred"
+    );
     if shards.is_empty() && single.is_none() {
         anyhow::bail!(
             "PLE: no `{lp}.ple_embedding.ngram_embedding.shard_*` was deferred, \
@@ -464,6 +477,9 @@ pub(super) fn load(
          serve it"
     )
 }
+
+#[cfg(test)]
+mod ple_layout_tests;
 
 #[cfg(all(test, feature = "cuda"))]
 mod slots_tests {
