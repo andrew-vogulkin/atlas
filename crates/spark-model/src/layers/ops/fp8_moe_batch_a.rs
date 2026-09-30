@@ -13,21 +13,65 @@ use crate::weight_map::{DenseWeight, Fp8DenseWeight, Fp8Weight, QuantizedWeight}
 
 use super::*;
 
-/// Speed pass 2026-09-29: the K=2 transposed NVFP4 expert GEMVs use the
-/// `_v4` kernels (4 columns per thread, uchar4 loads; same per-column math).
-/// `ATLAS_MOE_B2_V4=0` restores the byte-per-thread kernels.
+/// Speed pass 2026-09-29: the transposed NVFP4 expert GEMVs (single-token and
+/// K=2 batch) use the `_v4` kernels (4 columns per thread, uchar4 loads; same
+/// per-column math). `ATLAS_MOE_B2_V4=0` restores the byte-per-thread kernels.
 pub fn moe_batch2_v4() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("ATLAS_MOE_B2_V4").as_deref() != Ok("0"))
 }
 
-pub(super) fn b2_grid_x(n: u32) -> Result<u32> {
-    if moe_batch2_v4() {
-        anyhow::ensure!(n.is_multiple_of(T_BLOCK * 4), "moe batch2 v4: N={n} not a multiple of {}", T_BLOCK * 4);
+/// Handles of the `_v4` expert kernels that were actually loaded. The
+/// launchers size grid/smem from the handle they are given, so a caller that
+/// passes a non-v4 kernel (e.g. the ARM-2 `_e8m0` variants) keeps the
+/// original one-column-per-thread grid regardless of `ATLAS_MOE_B2_V4`.
+static V4_KERNELS: std::sync::RwLock<Vec<u64>> = std::sync::RwLock::new(Vec::new());
+
+/// Load `v4` from `module` when `moe_batch2_v4()` is on (and remember the
+/// handle as a v4 kernel), else `base`.
+pub fn load_moe_expert_kernel(
+    gpu: &dyn GpuBackend,
+    module: &str,
+    base: &str,
+    v4: &str,
+) -> Result<KernelHandle> {
+    if !moe_batch2_v4() {
+        return gpu.kernel(module, base);
+    }
+    let k = gpu.kernel(module, v4)?;
+    let mut set = V4_KERNELS.write().unwrap_or_else(|e| e.into_inner());
+    if !set.contains(&k.0) {
+        set.push(k.0);
+    }
+    Ok(k)
+}
+
+pub(super) fn is_v4_kernel(kernel: KernelHandle) -> bool {
+    kernel.0 != 0
+        && V4_KERNELS
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&kernel.0)
+}
+
+/// Grid x for a transposed expert GEMV launch of `kernel` over `n` columns.
+pub(super) fn b2_grid_x(kernel: KernelHandle, n: u32) -> Result<u32> {
+    if is_v4_kernel(kernel) {
+        anyhow::ensure!(
+            n.is_multiple_of(T_BLOCK * 4),
+            "moe expert v4: N={n} not a multiple of {}",
+            T_BLOCK * 4
+        );
         Ok(n / (T_BLOCK * 4))
     } else {
         Ok(div_ceil(n, T_BLOCK))
     }
+}
+
+/// Dynamic smem for the gate_up launch: the `_v4` kernel stages the f32
+/// activation row (`k` floats); the original kernel uses none.
+pub(super) fn gate_up_smem(kernel: KernelHandle, k: u32) -> u32 {
+    if is_v4_kernel(kernel) { k * 4 } else { 0 }
 }
 
 /// NVFP4 fused gate+up GEMV (transposed). K=2 batch.
@@ -55,9 +99,9 @@ pub fn moe_expert_gate_up_shared_batch2_t(
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
-        .grid([b2_grid_x(n)?, 2 * (top_k + 1), 2])
+        .grid([b2_grid_x(kernel, n)?, 2 * (top_k + 1), 2])
         .block([T_BLOCK, 1, 1])
-        .shared_mem(if moe_batch2_v4() { k * 4 } else { 0 })
+        .shared_mem(gate_up_smem(kernel, k))
         .arg_ptr(input)
         .arg_ptr(gate_packed_t_ptrs)
         .arg_ptr(gate_scale_t_ptrs)
@@ -105,7 +149,7 @@ pub fn moe_expert_silu_down_shared_batch2_t(
 ) -> Result<()> {
     let smem_bytes = (k as usize * std::mem::size_of::<f32>()) as u32;
     KernelLaunch::new(gpu, kernel)
-        .grid([b2_grid_x(n)?, 2 * (top_k + 1), 1])
+        .grid([b2_grid_x(kernel, n)?, 2 * (top_k + 1), 1])
         .block([T_BLOCK, 1, 1])
         .shared_mem(smem_bytes)
         .arg_ptr(gate_out)
