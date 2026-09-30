@@ -48,7 +48,7 @@ pub(super) fn hc_pre_split(
     let k_fin = gpu.kernel("hyper_connection", "hc_pre_finish")?;
 
     KernelLaunch::new(gpu, k_stage)
-        .grid([num_tokens, 1, 1])
+        .grid([num_tokens, if num_tokens <= 8 { hc_mult } else { 1 }, 1])
         .block([1024, 1, 1])
         .arg_ptr(streams)
         .arg_ptr(w.norm_w)
@@ -109,10 +109,12 @@ pub(super) fn hc_pre_split(
             HC_SMEM_MAX,
             hc_dim,
         );
-        let dsplit = (48 / num_tokens.max(1)).clamp(1, 10);
+        // One warp per rank row, 8 warps per block: spreads the 320 rows over
+        // 40 SMs instead of 10 (was 32 warps x 10 blocks). Per-row math unchanged.
+        let dsplit = (w.rank as u32).div_ceil(8).max(1);
         KernelLaunch::new(gpu, k_down)
             .grid([num_tokens, dsplit, 1])
-            .block([1024, 1, 1])
+            .block([256, 1, 1])
             .shared_mem(hc_smem as u32)
             .arg_ptr(normed)
             .arg_ptr(w.down_w)
@@ -162,7 +164,8 @@ pub(super) fn hc_pre_split(
     let (k_fin, grid_y, fblock) = if x4 {
         (
             gpu.kernel("hyper_connection", "hc_pre_finish_x4")?,
-            hidden_size.div_ceil(32),
+            // +1: the last y-block does only the injection contraction.
+            hidden_size.div_ceil(32) + 1,
             128,
         )
     } else {

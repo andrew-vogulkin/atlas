@@ -27,5 +27,10 @@ extern "C" __global__ void exl3_f32_to_bf16_rows(const float* __restrict__ in, _
 {
     unsigned n = rows * cols, stride = gridDim.x * blockDim.x;
     for (unsigned i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride)
-        out[(i / cols) * out_stride + (i % cols)] = __float2bfloat16_rn(in[i]);
+    {
+        // Padded rows (cols > out_stride, e.g. the lm_head: 248320-wide rows at a 248077 stride) would
+        // overlap the next row: drop the pad columns so rows never race or overrun.
+        unsigned c = i % cols;
+        if (c < out_stride) out[(i / cols) * out_stride + c] = __float2bfloat16_rn(in[i]);
+    }
 }

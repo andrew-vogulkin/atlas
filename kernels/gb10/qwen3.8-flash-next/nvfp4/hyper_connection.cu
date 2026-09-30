@@ -325,7 +325,8 @@ extern "C" __global__ void hc_post(
 #else
     #define HC_PQ(x) (x)
 #endif
-    for (unsigned int d = tid; d < H; d += QHC_BLOCK) {
+    // grid.y splits d (speed pass 2026-09-29); gridDim.y == 1 is the old loop.
+    for (unsigned int d = blockIdx.y * QHC_BLOCK + tid; d < H; d += QHC_BLOCK * gridDim.y) {
         float xd = (float)x[d];
         for (unsigned int s = 0; s < hc; ++s) {
             o[s * H + d] = HC_PQ(res[s * H + d] + xd * wv[s]);
@@ -362,7 +363,12 @@ extern "C" __global__ void hc_pre_stage(
     const unsigned int warp = tid >> 5;
     const unsigned int warps = blockDim.x >> 5;
 
-    for (unsigned int s2 = 0; s2 < hc; ++s2) {
+    // grid.y == hc (speed pass 2026-09-29): block y owns stream y only. The
+    // per-stream rms reduction is unchanged, so bitwise identical.
+    const bool per_stream = (gridDim.y == hc);
+    const unsigned int s_lo = per_stream ? blockIdx.y : 0u;
+    const unsigned int s_hi = per_stream ? blockIdx.y + 1u : hc;
+    for (unsigned int s2 = s_lo; s2 < s_hi; ++s2) {
         const float* xs = x + (size_t)s2 * H;
         float acc = 0.0f;
         for (unsigned int d = tid; d < H; d += blockDim.x) {
@@ -382,7 +388,7 @@ extern "C" __global__ void hc_pre_stage(
         }
         __syncthreads();
     }
-    for (unsigned int i = tid; i < hc_dim; i += blockDim.x) {
+    for (unsigned int i = s_lo * H + tid; i < s_hi * H; i += blockDim.x) {
         out[i] = x[i] * smem_rms[i / H] * (1.0f + (float)hc_norm_w[i]);
     }
 }
@@ -431,8 +437,26 @@ extern "C" __global__ void hc_pre_down(
     const unsigned int hc_dim = hc * hidden_size;
     const float inv_hc = 1.0f / (float)hc;
 
-    for (unsigned int i = threadIdx.x; i < hc_dim; i += blockDim.x) {
-        s_nx[i] = normed[(size_t)t * hc_dim + i];
+    // Staging with float4 loads, 8 in flight per thread (was one scalar load
+    // per iteration: ~hc_dim/blockDim dependent L2 round trips before any
+    // compute). Pure copy, so bitwise identical.
+    if ((hc_dim & 3u) == 0u) {
+        const float4* src4 = reinterpret_cast<const float4*>(normed + (size_t)t * hc_dim);
+        float4* dst4 = reinterpret_cast<float4*>(s_nx);
+        const unsigned int n4 = hc_dim >> 2;
+        unsigned int i = threadIdx.x;
+        for (; i + 7u * blockDim.x < n4; i += 8u * blockDim.x) {
+            float4 v[8];
+            #pragma unroll
+            for (unsigned int k = 0; k < 8; ++k) v[k] = src4[i + k * blockDim.x];
+            #pragma unroll
+            for (unsigned int k = 0; k < 8; ++k) dst4[i + k * blockDim.x] = v[k];
+        }
+        for (; i < n4; i += blockDim.x) dst4[i] = src4[i];
+    } else {
+        for (unsigned int i = threadIdx.x; i < hc_dim; i += blockDim.x) {
+            s_nx[i] = normed[(size_t)t * hc_dim + i];
+        }
     }
     __syncthreads();
 
@@ -443,7 +467,23 @@ extern "C" __global__ void hc_pre_down(
     for (unsigned int r = r0 + warp; r < r1; r += warps) {
         const __nv_bfloat16* row = down_w + (size_t)r * hc_dim;
         float acc = 0.0f;
-        for (unsigned int i = lane; i < hc_dim; i += 32) {
+        // Loads hoisted 8 deep; accumulation order per lane unchanged.
+        unsigned int i = lane;
+        for (; i + 31u * 32u < hc_dim; i += 32u * 32u) {
+            __nv_bfloat16 wv[32];
+            #pragma unroll
+            for (unsigned int k = 0; k < 32; ++k) wv[k] = row[i + k * 32u];
+            #pragma unroll
+            for (unsigned int k = 0; k < 32; ++k) acc += (float)wv[k] * s_nx[i + k * 32u];
+        }
+        for (; i + 7u * 32u < hc_dim; i += 8u * 32u) {
+            __nv_bfloat16 wv[8];
+            #pragma unroll
+            for (unsigned int k = 0; k < 8; ++k) wv[k] = row[i + k * 32u];
+            #pragma unroll
+            for (unsigned int k = 0; k < 8; ++k) acc += (float)wv[k] * s_nx[i + k * 32u];
+        }
+        for (; i < hc_dim; i += 32) {
             acc += (float)row[i] * s_nx[i];
         }
         #pragma unroll
@@ -773,6 +813,32 @@ extern "C" __global__ void hc_pre_finish_x4(
         const __nv_bfloat16* ub = up_w + i;
         float acc = 0.0f;
         unsigned int r = 0;
+        for (; r + 32 <= rank; r += 32) {
+            float l[32];
+            __nv_bfloat16 u[32];
+            #pragma unroll
+            for (unsigned int k = 0; k < 32; ++k) {
+                l[k] = smem_lo[r + k];
+                u[k] = ub[(size_t)(r + k) * hc_dim];
+            }
+            #pragma unroll
+            for (unsigned int k = 0; k < 32; ++k) {
+                acc += (float)u[k] * l[k];
+            }
+        }
+        for (; r + 16 <= rank; r += 16) {
+            float l[16];
+            __nv_bfloat16 u[16];
+            #pragma unroll
+            for (unsigned int k = 0; k < 16; ++k) {
+                l[k] = smem_lo[r + k];
+                u[k] = ub[(size_t)(r + k) * hc_dim];
+            }
+            #pragma unroll
+            for (unsigned int k = 0; k < 16; ++k) {
+                acc += (float)u[k] * l[k];
+            }
+        }
         for (; r + 8 <= rank; r += 8) {
             float l[8];
             __nv_bfloat16 u[8];
@@ -803,10 +869,31 @@ extern "C" __global__ void hc_pre_finish_x4(
 
     // Injection vector: same warp-per-stream contraction as `hc_pre_finish`
     // (there `s2 = warp; s2 < hc; s2 += warps` with 4 warps is this mapping).
-    if (inject_w != nullptr && blockIdx.y == 0) {
+    // Runs on the LAST block (host launches one extra y-block with no d range)
+    // so the 4-warp injection contraction no longer serializes behind a
+    // block that also owns output dims. Loads hoisted 8 deep; per-lane
+    // accumulation order unchanged.
+    if (inject_w != nullptr && blockIdx.y == gridDim.y - 1) {
         const __nv_bfloat16* row = inject_w + (size_t)warp * hc_dim;
         float acc = 0.0f;
-        for (unsigned int j = lane; j < hc_dim; j += 32) {
+        unsigned int j = lane;
+        for (; j + 31u * 32u < hc_dim; j += 32u * 32u) {
+            __nv_bfloat16 wv[32];
+            float xv[32];
+            #pragma unroll
+            for (unsigned int k = 0; k < 32; ++k) { wv[k] = row[j + k * 32u]; xv[k] = nx[j + k * 32u]; }
+            #pragma unroll
+            for (unsigned int k = 0; k < 32; ++k) acc += (float)wv[k] * xv[k];
+        }
+        for (; j + 7u * 32u < hc_dim; j += 8u * 32u) {
+            __nv_bfloat16 wv[8];
+            float xv[8];
+            #pragma unroll
+            for (unsigned int k = 0; k < 8; ++k) { wv[k] = row[j + k * 32u]; xv[k] = nx[j + k * 32u]; }
+            #pragma unroll
+            for (unsigned int k = 0; k < 8; ++k) acc += (float)wv[k] * xv[k];
+        }
+        for (; j < hc_dim; j += 32) {
             acc += (float)row[j] * nx[j];
         }
         #pragma unroll
