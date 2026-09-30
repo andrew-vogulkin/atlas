@@ -396,10 +396,9 @@ impl Qwen3AttentionLayer {
         // MoE dispatches per verify step with 12 batched ones -- which the 36
         // GDN layers have always done (`trait_decode_batched_hc.rs:305`).
         //
-        // `forward_k2_exact_routing`, not `forward_k2`: the plain batched top-k
-        // kernel drops the single-token kernel's tie-break, and that is what
-        // made the 2026-09-29 version of this change move the emitted text.
-        // See `MoeLayer::forward_k2_exact_routing`.
+        // Routing is per-row identical to the per-token path: the batched
+        // softmax top-k carries the same lower-index-wins tie-break as
+        // `moe_topk_softmax` (kernels/gb10/common/moe_topk.cu).
         //
         // `hc_post_site` is per-row elementwise with grid.x = num_tokens, so
         // one n=2 launch is bitwise the two n=1 launches it replaces.
@@ -409,7 +408,7 @@ impl Qwen3AttentionLayer {
             && !self.ffn.is_none()
             && std::env::var("ATLAS_MSHC_FFN_K2").as_deref() != Ok("0");
         if batch_ffn {
-            self.ffn.forward_k2_exact_routing(c.normed, ctx, stream)?;
+            self.ffn.forward_k2(c.normed, ctx, stream)?;
             ops::hc_post_site(
                 ctx.gpu,
                 self.hc_post_k,

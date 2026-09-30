@@ -395,22 +395,6 @@ impl FfnComponent {
         }
     }
 
-    /// `forward_k2` with routing byte-identical to two `forward` calls.
-    /// See `MoeLayer::forward_k2_exact_routing`. Dense FFNs have no router,
-    /// so their K=2 arm is already per-row exact.
-    pub fn forward_k2_exact_routing(
-        &self,
-        input: DevicePtr,
-        ctx: &ForwardContext,
-        stream: u64,
-    ) -> Result<()> {
-        match self {
-            Self::Moe(m) => m.forward_k2_exact_routing(input, ctx, stream),
-            Self::Dense(d) => d.forward_k2(input, ctx, stream),
-            Self::None => Ok(()),
-        }
-    }
-
     pub fn forward_k3(&self, input: DevicePtr, ctx: &ForwardContext, stream: u64) -> Result<()> {
         match self {
             Self::Moe(m) => m.forward_k3(input, ctx, stream),
