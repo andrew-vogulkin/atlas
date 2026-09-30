@@ -259,6 +259,24 @@ pub fn exl3_int8_linear_bf16_rows(
         stream,
     )?;
     exl3_int8_gemv(gpu, k8, ws, x_f16, m, w, a_had, c_f32, grid, stream)?;
+    exl3_f32_to_bf16_rows(gpu, k8, c_f32, out_bf16, m, n, out_stride, stream)
+}
+
+/// f32 `[m, n]` -> bf16 rows `out_stride` elements apart. Columns at or past
+/// `out_stride` are dropped: the lm_head is packed `n = 248320` wide (padded)
+/// but its logits rows are `vocab = 248077` apart, so a padded row must not
+/// spill into the next one.
+#[allow(clippy::too_many_arguments)]
+pub fn exl3_f32_to_bf16_rows(
+    gpu: &dyn GpuBackend,
+    k8: &Exl3Int8Kernels,
+    c_f32: DevicePtr,
+    out_bf16: DevicePtr,
+    m: u32,
+    n: usize,
+    out_stride: usize,
+    stream: u64,
+) -> Result<()> {
     KernelLaunch::new(gpu, k8.f32_to_bf16_rows)
         .grid([div_ceil(m * n as u32, 256).min(1024), 1, 1])
         .block([256, 1, 1])

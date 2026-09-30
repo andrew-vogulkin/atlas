@@ -324,3 +324,62 @@ fn int8_sq_timing() {
         }
     }
 }
+
+/// The lm_head is packed `n = 248320` wide (padded) while its logits rows are
+/// `vocab = 248077` apart (MTP verify, m = 2). Unless the pad columns are
+/// dropped, row 0's pad lands on row 1's tokens 0..242 (written by other,
+/// concurrently running blocks, so the winner varies run to run) and row 1's
+/// pad writes 243 elements past `2 * vocab`.
+#[test]
+#[ignore = "needs a GB10 GPU and a real kernel build"]
+fn f32_to_bf16_rows_padded_lm_head_rows_do_not_overlap() {
+    const N: usize = 248_320;
+    const V: usize = 248_077;
+    const GUARD: usize = 1024;
+    const MARK: u16 = 0x7FC1; // a NaN the conversion never produces
+    let g = gpu();
+    let k8 = Exl3Int8Kernels::resolve(&g).unwrap();
+    // Row 0: a pad-like sentinel everywhere. Row 1: small integers (exact in bf16).
+    let input: Vec<f32> = (0..2 * N)
+        .map(|i| {
+            if i < N {
+                -1.0e4
+            } else {
+                ((i - N) % 256) as f32 - 128.0
+            }
+        })
+        .collect();
+    let want = |r: usize, c: usize| bf16::from_f32(input[r * N + c]).to_bits();
+    let c_f32 = upload(
+        &g,
+        &input
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<u8>>(),
+    );
+    let fill: Vec<u8> = std::iter::repeat_n(MARK.to_le_bytes(), 2 * V + GUARD)
+        .flatten()
+        .collect();
+    let out = upload(&g, &fill);
+    let stream = g.default_stream();
+    for iter in 0..200 {
+        g.copy_h2d(&fill, out).unwrap();
+        exl3_f32_to_bf16_rows(&g, &k8, c_f32, out, 2, N, V, stream).unwrap();
+        g.synchronize(stream).unwrap();
+        let mut raw = vec![0u8; fill.len()];
+        g.copy_d2h(out, &mut raw).unwrap();
+        let got: Vec<u16> = raw
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        for c in 0..V {
+            assert_eq!(got[c], want(0, c), "iter {iter}: row 0 col {c}");
+            assert_eq!(got[V + c], want(1, c), "iter {iter}: row 1 col {c}");
+        }
+        let spill = got[2 * V..].iter().filter(|&&b| b != MARK).count();
+        assert_eq!(spill, 0, "iter {iter}: {spill} writes past 2 * vocab");
+    }
+    for p in [c_f32, out] {
+        g.free(p).unwrap();
+    }
+}
