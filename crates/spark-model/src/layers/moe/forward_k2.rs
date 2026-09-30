@@ -21,6 +21,43 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        self.forward_k2_routed(input, false, ctx, stream)
+    }
+
+    /// `forward_k2` whose plain-softmax routing is byte-identical to two
+    /// separate `MoeLayer::forward` calls.
+    ///
+    /// `moe_topk_softmax_batched` (the batched top-k kernel this path normally
+    /// uses) OMITS the deterministic lower-index-wins tie-break that the
+    /// single-token `moe_topk_softmax` carries in both of its reductions
+    /// (`kernels/gb10/common/moe_topk.cu`: single-token :79/:95 vs batched
+    /// :365/:378). With 512 BF16 router logits and top-10, exact ties happen,
+    /// and on a tie the two kernels pick different experts — which is exactly
+    /// why batching the mHC attention-layer verify FFN changed the emitted text
+    /// and dropped MTP acceptance (.861 -> .796) in the 2026-09-29 pass.
+    ///
+    /// With `exact_per_token_routing`, the plain-softmax branch runs the
+    /// single-token kernel once per row instead (grid(1) x2, ~2 us), so routing
+    /// is bit-for-bit the per-token result while the expensive expert GEMVs
+    /// still batch. The batched kernel is deliberately NOT changed: prefill and
+    /// the 36 GDN decode layers use it too, and altering it would move their
+    /// routing (and the served text) as well.
+    pub fn forward_k2_exact_routing(
+        &self,
+        input: DevicePtr,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        self.forward_k2_routed(input, true, ctx, stream)
+    }
+
+    fn forward_k2_routed(
+        &self,
+        input: DevicePtr, // [2, H] BF16 — normed MoE input for 2 tokens
+        exact_per_token_routing: bool,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
         // LongCat zero-experts are wired only on the single-token decode
         // + prefill paths (v1); this variant would silently mis-route the
         // 384-wide router. Named refusal, not silent wrongness.
@@ -175,6 +212,25 @@ impl MoeLayer {
                     ctx.config.norm_topk_prob,
                     ctx.config.routed_scaling_factor as f32,
                     2,
+                    stream,
+                )?;
+            }
+        } else if exact_per_token_routing {
+            // Per-row single-token kernel: same arithmetic AND same tie-break
+            // as `MoeLayer::forward`. gate_logits is BF16 [2, num_experts]
+            // (2-byte stride); indices/weights are [2, top_k] (u32/f32,
+            // 4-byte stride) — the same striding the sqrtsoftplus arm above
+            // uses for its per-token loop.
+            for t in 0..2usize {
+                ops::moe_topk_softmax(
+                    ctx.gpu,
+                    self.moe_topk,
+                    gate_logits.offset(t * num_experts as usize * 2),
+                    indices_dev.offset(t * top_k as usize * 4),
+                    weights_dev.offset(t * top_k as usize * 4),
+                    num_experts,
+                    top_k,
+                    ctx.config.norm_topk_prob,
                     stream,
                 )?;
             }

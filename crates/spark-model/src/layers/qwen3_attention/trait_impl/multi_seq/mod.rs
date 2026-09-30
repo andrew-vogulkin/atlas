@@ -390,27 +390,62 @@ impl Qwen3AttentionLayer {
                 .copy_d2d_async(c.hidden, c.normed, n * h * 2, stream)?;
         }
 
-        // Per-token sequential FFN (MLA models always take this path).
-        for i in 0..n {
-            let normed2_i = c.normed.offset(i * c.h * c.bf16);
-            let moe_out = self.ffn.forward(normed2_i, ctx, stream)?;
-            // hc_streams is the FP32 mHC highway (4 bytes/elem), not BF16.
-            let hc_streams_i = hc_streams.offset(i * hc.hc_mult * c.h * 4);
-            let post_i = post.offset(i * hc.hc_mult * 4);
-            let comb_i = comb.offset(i * hc.hc_mult * hc.hc_mult * 4);
+        // K=2 verify (num_drafts=1): one batched MoE + one n=2 `hc_post`
+        // instead of two single-token FFNs and two n=1 `hc_post`s. On this
+        // model that replaces 12 attention layers x 2 tokens = 24 single-token
+        // MoE dispatches per verify step with 12 batched ones -- which the 36
+        // GDN layers have always done (`trait_decode_batched_hc.rs:305`).
+        //
+        // `forward_k2_exact_routing`, not `forward_k2`: the plain batched top-k
+        // kernel drops the single-token kernel's tie-break, and that is what
+        // made the 2026-09-29 version of this change move the emitted text.
+        // See `MoeLayer::forward_k2_exact_routing`.
+        //
+        // `hc_post_site` is per-row elementwise with grid.x = num_tokens, so
+        // one n=2 launch is bitwise the two n=1 launches it replaces.
+        //
+        // Kill switch: `ATLAS_MSHC_FFN_K2=0` restores the per-token loop.
+        let batch_ffn = n == 2
+            && !self.ffn.is_none()
+            && std::env::var("ATLAS_MSHC_FFN_K2").as_deref() != Ok("0");
+        if batch_ffn {
+            self.ffn.forward_k2_exact_routing(c.normed, ctx, stream)?;
             ops::hc_post_site(
                 ctx.gpu,
                 self.hc_post_k,
                 hc,
-                moe_out,
-                hc_streams_i,
-                post_i,
-                comb_i,
-                hc_streams_i,
-                1,
+                ctx.buffers.moe_output(),
+                hc_streams,
+                post,
+                comb,
+                hc_streams,
+                n as u32,
                 h as u32,
                 stream,
             )?;
+        } else {
+            // Per-token sequential FFN (MLA models always take this path).
+            for i in 0..n {
+                let normed2_i = c.normed.offset(i * c.h * c.bf16);
+                let moe_out = self.ffn.forward(normed2_i, ctx, stream)?;
+                // hc_streams is the FP32 mHC highway (4 bytes/elem), not BF16.
+                let hc_streams_i = hc_streams.offset(i * hc.hc_mult * c.h * 4);
+                let post_i = post.offset(i * hc.hc_mult * 4);
+                let comb_i = comb.offset(i * hc.hc_mult * hc.hc_mult * 4);
+                ops::hc_post_site(
+                    ctx.gpu,
+                    self.hc_post_k,
+                    hc,
+                    moe_out,
+                    hc_streams_i,
+                    post_i,
+                    comb_i,
+                    hc_streams_i,
+                    1,
+                    h as u32,
+                    stream,
+                )?;
+            }
         }
         if diag_this {
             super::diag_norm_f32(
