@@ -358,11 +358,12 @@ extern "C" __global__ void moe_topk_softmax_batched(
                 local_idx = i;
             }
         }
+        // Deterministic lower-index-wins tie-break, identical to moe_topk_softmax (single-token).
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
             float other_val = __shfl_down_sync(0xFFFFFFFF, local_max, offset);
             unsigned int other_idx = __shfl_down_sync(0xFFFFFFFF, local_idx, offset);
-            if (other_val > local_max) {
+            if (other_val > local_max || (other_val == local_max && other_idx < local_idx)) {
                 local_max = other_val;
                 local_idx = other_idx;
             }
@@ -376,7 +377,7 @@ extern "C" __global__ void moe_topk_softmax_batched(
             float best_val = s_warp_val[0];
             unsigned int best_idx = s_warp_idx[0];
             for (unsigned int w = 1; w < num_warps; w++) {
-                if (s_warp_val[w] > best_val) {
+                if (s_warp_val[w] > best_val || (s_warp_val[w] == best_val && s_warp_idx[w] < best_idx)) {
                     best_val = s_warp_val[w];
                     best_idx = s_warp_idx[w];
                 }
