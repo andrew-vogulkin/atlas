@@ -393,6 +393,79 @@ extern "C" __global__ void hc_pre_stage(
     }
 }
 
+// ── hc_post + hc_pre_stage, fused (round-2 item 4, 2026-09-30) ──
+// One launch doing `hc_post` (in place on `streams`) then `hc_pre_stage`
+// for the SAME streams, keeping each lane's post values in registers so the
+// 40 KB/token highway is not re-read from global right after being written.
+// grid=[T, hc], block=1024 -- exactly `hc_pre_stage`'s small-T geometry, so
+// every lane owns the same `d` set (d = tid + k*1024) and the rms reduction
+// is the same tree in the same order. The post value per element is the
+// same expression `res + x*inj` as `hc_post` (geometry-independent,
+// elementwise). Bitwise identical to hc_post -> hc_pre_stage. The host only
+// launches this when H <= HC_FUSE_MAXV * blockDim.x.
+#define HC_FUSE_MAXV 4
+extern "C" __global__ void hc_post_stage(
+    const __nv_bfloat16* __restrict__ block_out, // [T, H]
+    float* __restrict__ streams,                 // [T, hc, H], updated in place
+    const float* __restrict__ inj,               // [T, hc]
+    const __nv_bfloat16* __restrict__ hc_norm_w,
+    float* __restrict__ normed_out,              // [T, hc*H]
+    const unsigned int hidden_size,
+    const unsigned int hc,
+    const float eps
+) {
+    const unsigned int t = blockIdx.x;
+    const unsigned int s = blockIdx.y;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int H = hidden_size;
+    const unsigned int hc_dim = hc * H;
+    const __nv_bfloat16* x = block_out + (size_t)t * H;
+    float* xs = streams + (size_t)t * hc_dim + (size_t)s * H;
+    float* out = normed_out + (size_t)t * hc_dim + (size_t)s * H;
+    const __nv_bfloat16* nw = hc_norm_w + (size_t)s * H;
+    const float wv = inj[(size_t)t * hc + s];
+
+    __shared__ float smem_rms;
+    __shared__ float smem_red[QHC_WBLOCK / 32];
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5;
+    const unsigned int warps = blockDim.x >> 5;
+
+    float v[HC_FUSE_MAXV];
+    float acc = 0.0f;
+    #pragma unroll
+    for (unsigned int k = 0; k < HC_FUSE_MAXV; ++k) {
+        const unsigned int d = tid + k * blockDim.x;
+        if (d < H) {
+            float xd = (float)x[d];
+            float o = xs[d] + xd * wv;
+            xs[d] = o;
+            v[k] = o;
+            acc += o * o;
+        }
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+    }
+    if (lane == 0) smem_red[warp] = acc;
+    __syncthreads();
+    if (tid == 0) {
+        float tot = 0.0f;
+        for (unsigned int w2 = 0; w2 < warps; ++w2) tot += smem_red[w2];
+        smem_rms = rsqrtf(tot / (float)H + eps);
+    }
+    __syncthreads();
+    const float rms = smem_rms;
+    #pragma unroll
+    for (unsigned int k = 0; k < HC_FUSE_MAXV; ++k) {
+        const unsigned int d = tid + k * blockDim.x;
+        if (d < H) {
+            out[d] = v[k] * rms * (1.0f + (float)nw[d]);
+        }
+    }
+}
+
 // Stage 2: low[r] = silu(down[r] . normed / hc), rank rows split over
 // blockIdx.y. Warp per row, coalesced lane strides.
 extern "C" __global__ void hc_pre_down(

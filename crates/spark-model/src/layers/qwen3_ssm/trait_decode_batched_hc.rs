@@ -258,30 +258,17 @@ impl Qwen3SsmLayer {
         // `ctx.buffers.moe_output()`, which the FFN below overwrites. Consuming
         // it into the highway first is what makes that safe — same ordering
         // constraint `trait_prefill_hc` documents.
-        ops::hc_post_site(
+        // hc_post (attn -> streams) + the FFN's hc_pre, fused into one launch
+        // on the low-rank decode path (round-2 item 4, ATLAS_HC_POST_FUSE=0 off).
+        let normed2 = ctx.buffers.norm_output();
+        ops::hc_post_pre_site(
             ctx.gpu,
             self.hc_post_k,
+            self.hc_pre_k,
             hc,
+            &hc.ffn,
             out_proj_buf,
             streams,
-            post,
-            comb,
-            streams,
-            n,
-            h as u32,
-            stream,
-        )?;
-
-        stage!("hc_post_attn");
-
-        // ── MoE sublayer ──
-        let normed2 = ctx.buffers.norm_output();
-        ops::hc_pre_site(
-            ctx.gpu,
-            self.hc_pre_k,
-            streams,
-            &hc.ffn,
-            hc,
             normed2,
             post,
             comb,
