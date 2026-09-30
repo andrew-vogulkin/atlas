@@ -354,7 +354,40 @@ __device__ __forceinline__ void gemv_int8_row_sums
 // at (M + r) * slice_stride - at M = 1 this is exactly the coop kernel's sh_as/sh_as2 layout). Row
 // accumulators go to accs + r * acc_stride, atomically or with plain stores (exclusive per-slice
 // partials of the sq kernel).
-template <int M, bool residual, bool atomic = true>
+
+// L2 cache-policy hint on the trellis weight stream (R2 vocab-l2 item B). L2P: 0 = none (original
+// instructions), 1 = evict_first, 2 = evict_last. Pure caching hints: same bytes, same order, same math.
+template <int L2P>
+__device__ __forceinline__ uint64_t gemv_l2_policy()
+{
+    uint64_t p = 0;
+    if constexpr (L2P == 1) asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(p));
+    if constexpr (L2P == 2) asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(p));
+    return p;
+}
+template <int L2P>
+__device__ __forceinline__ void cp_async_l2(void* smem_ptr, const void* glob_ptr, uint64_t pol)
+{
+    if constexpr (L2P == 0) { cp_async(smem_ptr, glob_ptr); }
+    else
+    {
+        uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+        asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2;\n" :: "r"(smem), "l"(glob_ptr), "l"(pol));
+    }
+}
+template <int L2P>
+__device__ __forceinline__ uint2 ld_u2_l2(const uint32_t* p, uint64_t pol)
+{
+    if constexpr (L2P == 0) { return *(const uint2*) p; }
+    else
+    {
+        uint2 r;
+        asm volatile("ld.global.nc.L2::cache_hint.v2.u32 {%0, %1}, [%2], %3;" : "=r"(r.x), "=r"(r.y) : "l"(p), "l"(pol));
+        return r;
+    }
+}
+
+template <int M, bool residual, bool atomic = true, int L2P = 0>
 __device__ __forceinline__ void gemv_int8_unit_wide
 (
     const uint16_t* __restrict__ B,
@@ -377,14 +410,15 @@ __device__ __forceinline__ void gemv_int8_unit_wide
     int shfl_src = (lane & 16) | ((lane + 15) & 15);
 
     int iacc0[M] = {}, iacc1[M] = {}, jacc0[M] = {}, jacc1[M] = {};
-    uint2 r0 = *(const uint2*) bp;
+    const uint64_t l2pol = gemv_l2_policy<L2P>();
+    uint2 r0 = ld_u2_l2<L2P>(bp, l2pol);
     uint2 r1 = {};
-    if (nrows > 1) r1 = *(const uint2*) (bp + row_stride);
+    if (nrows > 1) r1 = ld_u2_l2<L2P>(bp + row_stride, l2pol);
 
     for (int kb = 0; kb < nrows; ++kb)
     {
         uint2 r2 = {};
-        if (kb + 2 < nrows) r2 = *(const uint2*) (bp + (size_t) (kb + 2) * row_stride);
+        if (kb + 2 < nrows) r2 = ld_u2_l2<L2P>(bp + (size_t) (kb + 2) * row_stride, l2pol);
         uint32_t prev = __shfl_sync(0xffffffff, r0.y, shfl_src);
 
         uint32_t w0, w1, w2, w3, w4, w5, w6, w7;
@@ -683,7 +717,7 @@ __device__ __forceinline__ void gemv_int8_unit_narrow
 // slice with cp.async (coalesced 16 B chunks, one commit group per row, GEMV_STAGE_D rows deep) and
 // extracts from shared memory. Used for the K where scattered pointer extraction leaves the most
 // load latency exposed (3, 5, 7); warp-private slices need no block-level synchronization.
-template <int bits, int M, bool residual, bool atomic = true, bool HALF = false>
+template <int bits, int M, bool residual, bool atomic = true, bool HALF = false, int L2P = 0>
 __device__ __forceinline__ void gemv_int8_unit_smem
 (
     const uint16_t* __restrict__ B,
@@ -709,10 +743,11 @@ __device__ __forceinline__ void gemv_int8_unit_smem
     const uint32_t* bp = ((const uint32_t*) B) + (size_t) kb0 * row_stride + (size_t) nbp * pairwords;
     uint32_t* sb = sh_b + warp * (D * pairwords);
 
+    const uint64_t l2pol = gemv_l2_policy<L2P>();
     auto stage_row = [&] (int kb)
     {
         if (kb < nrows && lane < chunks)
-            cp_async(sb + (kb % D) * pairwords + lane * 4, bp + (size_t) kb * row_stride + lane * 4);
+            cp_async_l2<L2P>(sb + (kb % D) * pairwords + lane * 4, bp + (size_t) kb * row_stride + lane * 4, l2pol);
         cp_async_fence();
     };
     #pragma unroll
@@ -1101,7 +1136,7 @@ __host__ __device__ constexpr int gemv_int8_sq_rows_max(int M, bool residual)
     return cap < SQ_ROWS_MAX ? cap : SQ_ROWS_MAX;
 }
 
-template <int bits, int M, bool c_fp32, bool residual, bool HALF = false, bool BF16IO = false>
+template <int bits, int M, bool c_fp32, bool residual, bool HALF = false, bool BF16IO = false, int L2P = 0>
 __device__ __forceinline__
 void exl3_gemv_int8_sq_kernel
 (
@@ -1165,9 +1200,9 @@ void exl3_gemv_int8_sq_kernel
         }
         int* pacc = partials + (size_t) slice * M * pstride;
         if constexpr (bits == 4 && !HALF)
-            gemv_int8_unit_wide<M, residual, false>(B, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, size_n);
+            gemv_int8_unit_wide<M, residual, false, L2P>(B, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, size_n);
         else if constexpr (gemv_int8_stage_smem(bits, HALF))
-            gemv_int8_unit_smem<bits, M, residual, false, HALF>(B, pacc, pstride, sh_as, slice_stride, sh_b, nb256, kb0, nrows, size_n);
+            gemv_int8_unit_smem<bits, M, residual, false, HALF, L2P>(B, pacc, pstride, sh_as, slice_stride, sh_b, nb256, kb0, nrows, size_n);
         else
             gemv_int8_unit_narrow<bits, M, residual, false, HALF>(B, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, size_n);
 

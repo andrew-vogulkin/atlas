@@ -128,15 +128,26 @@ pub struct Exl3Int8Kernels {
 impl Exl3Int8Kernels {
     pub fn resolve(gpu: &dyn GpuBackend) -> Result<Self> {
         let k = |name: &str| gpu.kernel("exl3_int8", name);
+        // R2 vocab-l2 item B: L2 cache-policy hint on the K4/K5 trellis weight stream.
+        // Default on: evict_first. ATLAS_SQ_L2HINT = 0|off (kill switch: original kernels) | last (evict_last).
+        let suf = match std::env::var("ATLAS_SQ_L2HINT").as_deref() {
+            Ok("0") | Ok("off") => "",
+            Ok("last") => "_l2l",
+            _ => "_l2f",
+        };
+        let h = |name: &str| gpu.kernel("exl3_int8", &format!("{name}{suf}"));
+        if !suf.is_empty() {
+            tracing::info!("exl3 sq GEMV: L2 weight-stream hint {suf}");
+        }
         Ok(Self {
             sq: [
-                [k("exl3_int8_sq_k4_m1")?, k("exl3_int8_sq_k4_m2")?],
-                [k("exl3_int8_sq_k5_m1")?, k("exl3_int8_sq_k5_m2")?],
+                [h("exl3_int8_sq_k4_m1")?, h("exl3_int8_sq_k4_m2")?],
+                [h("exl3_int8_sq_k5_m1")?, h("exl3_int8_sq_k5_m2")?],
                 [k("exl3_int8_sq_k6_m1")?, k("exl3_int8_sq_k6_m2")?],
             ],
             sq_bf16: [
-                [k("exl3_int8_sq_k4_m1_bf16")?, k("exl3_int8_sq_k4_m2_bf16")?],
-                [k("exl3_int8_sq_k5_m1_bf16")?, k("exl3_int8_sq_k5_m2_bf16")?],
+                [h("exl3_int8_sq_k4_m1_bf16")?, h("exl3_int8_sq_k4_m2_bf16")?],
+                [h("exl3_int8_sq_k5_m1_bf16")?, h("exl3_int8_sq_k5_m2_bf16")?],
                 [k("exl3_int8_sq_k6_m1_bf16")?, k("exl3_int8_sq_k6_m2_bf16")?],
             ],
             f32_to_bf16: k("exl3_f32_to_bf16")?,
