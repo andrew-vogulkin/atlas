@@ -821,7 +821,95 @@ __device__ __forceinline__ void gemv_int8_epilogue
 // Stage one slice for M activation rows: Hadamard from A into sh_ah, slice max -> q_s, splats +
 // exact sums per row. Bit-identical in every block that stages the same slice. Rows >= size_m
 // (padding at M = 4, m = 3) get zero splats and dummy scales.
-template <int M, bool residual>
+// B3 (atlas-ple-speed): bf16-in / bf16-out helpers for the folded verify GEMV.
+// `had_bf_r_128_pre` is had_hf_r_128_inner<true, false> with the input read as bf16 and converted
+// per element with exactly the op of the removed `exl3_bf16_to_f16` launch
+// (__float2half_rn(__bfloat162float(x))); everything after the load is unchanged.
+inline __device__ void had_bf_r_128_pre
+(
+    const __nv_bfloat16* __restrict__ input_ptr,
+    half* __restrict__ output_ptr,
+    const half* __restrict__ scale,
+    const float r_scale
+)
+{
+    int t = threadIdx.x & 31;
+    uint2 raw = ((const uint2*) input_ptr)[t];
+    half h0 = __float2half_rn(__bfloat162float(__ushort_as_bfloat16((unsigned short) (raw.x & 0xffff))));
+    half h1 = __float2half_rn(__bfloat162float(__ushort_as_bfloat16((unsigned short) (raw.x >> 16))));
+    half h2 = __float2half_rn(__bfloat162float(__ushort_as_bfloat16((unsigned short) (raw.y & 0xffff))));
+    half h3 = __float2half_rn(__bfloat162float(__ushort_as_bfloat16((unsigned short) (raw.y >> 16))));
+    half4 v(h0, h1, h2, h3);
+    {
+        int i = blockIdx.y * 32 + t;
+        half4 scales = ((half4*) scale)[i];
+        v.x = __hmul2(v.x, scales.x);
+        v.y = __hmul2(v.y, scales.y);
+    }
+    float v0 = __half2float(__low2half(v.x));
+    float v1 = __half2float(__high2half(v.x));
+    float v2 = __half2float(__low2half(v.y));
+    float v3 = __half2float(__high2half(v.y));
+    float s0 = v0 + v1;
+    float d0 = v0 - v1;
+    float s1 = v2 + v3;
+    float d1 = v2 - v3;
+    float h0f = s0 + s1;
+    float h1f = d0 + d1;
+    float h2f = s0 - s1;
+    float h3f = d0 - d1;
+    shuffle_had_f4x32(h0f, h1f, h2f, h3f, t);
+    v.x = __floats2half2_rn(h0f * r_scale, h1f * r_scale);
+    v.y = __floats2half2_rn(h2f * r_scale, h3f * r_scale);
+    ((half4*) output_ptr)[t] = v;
+}
+
+// had_ff_r_128_inner<false, true> with the fp32 result rounded straight to bf16 with the op of the
+// removed `exl3_f32_to_bf16_rows` launch (__float2bfloat16_rn) instead of stored as fp32.
+inline __device__ void had_ff_r_128_post_bf16
+(
+    const float* __restrict__ input_ptr,
+    __nv_bfloat16* __restrict__ output_ptr,
+    const half* __restrict__ scale,
+    const float r_scale
+)
+{
+    int t = threadIdx.x & 31;
+    float4 v = ((float4*) input_ptr)[t];
+    float v0 = v.x;
+    float v1 = v.y;
+    float v2 = v.z;
+    float v3 = v.w;
+    float s0 = v0 + v1;
+    float d0 = v0 - v1;
+    float s1 = v2 + v3;
+    float d1 = v2 - v3;
+    v.x = s0 + s1;
+    v.y = d0 + d1;
+    v.z = s0 - s1;
+    v.w = d0 - d1;
+    shuffle_had_f2x32(v.x, v.y, t);
+    shuffle_had_f2x32(v.z, v.w, t);
+    v.x *= r_scale;
+    v.y *= r_scale;
+    v.z *= r_scale;
+    v.w *= r_scale;
+    {
+        int i = blockIdx.y * 32 + t;
+        half4 scales = ((half4*) scale)[i];
+        v.x *= __low2float(scales.x);
+        v.y *= __high2float(scales.x);
+        v.z *= __low2float(scales.y);
+        v.w *= __high2float(scales.y);
+    }
+    __nv_bfloat16* o = output_ptr + t * 4;
+    o[0] = __float2bfloat16_rn(v.x);
+    o[1] = __float2bfloat16_rn(v.y);
+    o[2] = __float2bfloat16_rn(v.z);
+    o[3] = __float2bfloat16_rn(v.w);
+}
+
+template <int M, bool residual, bool BF16IO = false>
 __device__ __forceinline__ void gemv_int8_stage_slice
 (
     const half* __restrict__ A,
@@ -861,9 +949,18 @@ __device__ __forceinline__ void gemv_int8_stage_slice
             }
             continue;
         }
-        const half* Ar = A + (size_t) r * size_k;
-        for (int sp = t >> 5; sp < (nel >> 7); sp += NUM_THREADS >> 5)
-            had_hf_r_128_inner<true, false>(Ar + (kb0 << 4) + (sp << 7), sh_ah + (sp << 7), suh + (kb0 << 4) + (sp << 7), 0.088388347648f);
+        if constexpr (BF16IO)
+        {
+            const __nv_bfloat16* Arb = reinterpret_cast<const __nv_bfloat16*>(A) + (size_t) r * size_k;
+            for (int sp = t >> 5; sp < (nel >> 7); sp += NUM_THREADS >> 5)
+                had_bf_r_128_pre(Arb + (kb0 << 4) + (sp << 7), sh_ah + (sp << 7), suh + (kb0 << 4) + (sp << 7), 0.088388347648f);
+        }
+        else
+        {
+            const half* Ar = A + (size_t) r * size_k;
+            for (int sp = t >> 5; sp < (nel >> 7); sp += NUM_THREADS >> 5)
+                had_hf_r_128_inner<true, false>(Ar + (kb0 << 4) + (sp << 7), sh_ah + (sp << 7), suh + (kb0 << 4) + (sp << 7), 0.088388347648f);
+        }
         __syncthreads();
 
         float mx = 0.0f;
@@ -933,7 +1030,7 @@ __device__ __forceinline__ void gemv_int8_stage_slice
 // Epilogue for one 256-column group: deterministic fixed-order combine over the per-slice partials,
 // warp per (row, 128-span). Reads bypass L1 (__ldcg): the contributions arrived from other blocks
 // with no grid-wide barrier.
-template <int M, bool c_fp32, bool residual>
+template <int M, bool c_fp32, bool residual, bool BF16IO = false>
 __device__ __forceinline__ void gemv_int8_epilogue_group_sq
 (
     const int* __restrict__ partials,
@@ -945,7 +1042,8 @@ __device__ __forceinline__ void gemv_int8_epilogue_group_sq
     const half* __restrict__ svh,
     float* __restrict__ sh_tmp,
     int nb256,
-    int size_n
+    int size_n,
+    int out_stride = 0
 )
 {
     int warp = threadIdx.x >> 5;
@@ -983,7 +1081,9 @@ __device__ __forceinline__ void gemv_int8_epilogue_group_sq
     for (int i = 0; i < 4; ++i)
         tmp[lane * 4 + i] = k_inv * acc[i] + corr;
     __syncwarp();
-    if constexpr (c_fp32)
+    if constexpr (BF16IO)
+        had_ff_r_128_post_bf16(tmp, ((__nv_bfloat16*) C) + (size_t) row * out_stride + base, svh + base, 0.088388347648f);
+    else if constexpr (c_fp32)
         had_ff_r_128_inner<false, true>(tmp, ((float*) C) + (size_t) row * size_n + base, svh + base, 0.088388347648f);
     else
         had_fh_r_128_inner<false, true>(tmp, ((half*) C) + (size_t) row * size_n + base, svh + base, 0.088388347648f);
@@ -998,7 +1098,7 @@ __host__ __device__ constexpr int gemv_int8_sq_rows_max(int M, bool residual)
     return cap < SQ_ROWS_MAX ? cap : SQ_ROWS_MAX;
 }
 
-template <int bits, int M, bool c_fp32, bool residual, bool HALF = false>
+template <int bits, int M, bool c_fp32, bool residual, bool HALF = false, bool BF16IO = false>
 __device__ __forceinline__
 void exl3_gemv_int8_sq_kernel
 (
@@ -1011,7 +1111,8 @@ void exl3_gemv_int8_sq_kernel
     int* __restrict__ locks,
     const half* __restrict__ suh,
     half* __restrict__ A_had,
-    const half* __restrict__ svh
+    const half* __restrict__ svh,
+    const int out_stride = 0
 )
 {
     extern __shared__ uint32_t shmem[];
@@ -1055,7 +1156,7 @@ void exl3_gemv_int8_sq_kernel
         int nrows = MIN(rows_per, rows_total - kb0);
         if (slice != prev_slice)
         {
-            gemv_int8_stage_slice<M, residual>(A, size_m, size_k, suh, qsums + 4 * slice * M,
+            gemv_int8_stage_slice<M, residual, BF16IO>(A, size_m, size_k, suh, qsums + 4 * slice * M,
                                                sh_ah, sh_as, slice_stride, sh_red, kb0, nrows);
             prev_slice = slice;
         }
@@ -1075,8 +1176,8 @@ void exl3_gemv_int8_sq_kernel
         __syncthreads();
         if (sh_last)
         {
-            gemv_int8_epilogue_group_sq<M, c_fp32, residual>(partials, qsums, pstride, ksplit, size_m,
-                                                             C, svh, sh_tmp, nb256, size_n);
+            gemv_int8_epilogue_group_sq<M, c_fp32, residual, BF16IO>(partials, qsums, pstride, ksplit, size_m,
+                                                                     C, svh, sh_tmp, nb256, size_n, out_stride);
             if (t == 0) counters[nb256] = 0;
         }
     }

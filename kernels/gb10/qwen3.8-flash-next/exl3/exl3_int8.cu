@@ -14,6 +14,20 @@
 
 EXL3_SQ_ENTRY(4, 1) EXL3_SQ_ENTRY(4, 2) EXL3_SQ_ENTRY(5, 1) EXL3_SQ_ENTRY(5, 2) EXL3_SQ_ENTRY(6, 1) EXL3_SQ_ENTRY(6, 2)
 
+// B3: same GEMV with the bf16 -> f16 input conversion and the f32 -> bf16 row output folded in
+// (A is bf16 [m, k]; C is bf16 rows `out_stride` elements apart). Same grid / decomposition / math.
+#define EXL3_SQ_ENTRY_BF16(K, M)                                                                                \
+    extern "C" __global__ __launch_bounds__(256) void exl3_int8_sq_k##K##_m##M##_bf16(                          \
+        const __nv_bfloat16* __restrict__ A, const uint16_t* __restrict__ B, void* __restrict__ C,             \
+        const int size_m, const int size_k, const int size_n, int* __restrict__ locks,                         \
+        const half* __restrict__ suh, half* __restrict__ A_had, const half* __restrict__ svh,                  \
+        const int out_stride)                                                                                   \
+    { exl3_gemv_int8_sq_kernel<K, M, true, false, false, true>((const half*) A, B, C, size_m, size_k, size_n,   \
+                                                               locks, suh, A_had, svh, out_stride); }
+
+EXL3_SQ_ENTRY_BF16(4, 1) EXL3_SQ_ENTRY_BF16(4, 2) EXL3_SQ_ENTRY_BF16(5, 1) EXL3_SQ_ENTRY_BF16(5, 2)
+EXL3_SQ_ENTRY_BF16(6, 1) EXL3_SQ_ENTRY_BF16(6, 2)
+
 extern "C" __global__ void exl3_f32_to_bf16(const float* __restrict__ in, __nv_bfloat16* __restrict__ out, unsigned n)
 {
     unsigned stride = gridDim.x * blockDim.x;
