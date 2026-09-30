@@ -258,7 +258,16 @@ pub fn hc_post_lowrank(
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
-        .grid([num_tokens, 1, 1])
+        // Small T: split d over grid.y (kernel loop is grid-stride on y).
+        .grid([
+            num_tokens,
+            if num_tokens <= 8 {
+                hidden_size.div_ceil(256).max(1)
+            } else {
+                1
+            },
+            1,
+        ])
         .block([256, 1, 1])
         .arg_ptr(block_out)
         .arg_ptr(residual)

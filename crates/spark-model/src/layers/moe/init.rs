@@ -286,9 +286,9 @@ impl MoeLayer {
             // ── Phase 8a transposed-layout decode kernels ──
             // Module name = file stem (default convention in atlas-kernels).
             moe_expert_gate_up_shared_t_k: gpu
-                .kernel("moe_shared_expert_fused_t", "moe_expert_gate_up_shared_t")?,
+                .kernel("moe_shared_expert_fused_t", if crate::layers::ops::moe_batch2_v4() { "moe_expert_gate_up_shared_t_v4" } else { "moe_expert_gate_up_shared_t" })?,
             moe_expert_silu_down_shared_t_k: gpu
-                .kernel("moe_shared_expert_fused_t", "moe_expert_silu_down_shared_t")?,
+                .kernel("moe_shared_expert_fused_t", if crate::layers::ops::moe_batch2_v4() { "moe_expert_silu_down_shared_t_v4" } else { "moe_expert_silu_down_shared_t" })?,
             // ARM-2 Phase-K dual-format decode variants (E8M0 routed / NVFP4
             // shared). try_kernel — the entries are in the common .cu but load
             // by name; 0 where a target doesn't compile that module.
@@ -345,11 +345,11 @@ impl MoeLayer {
             tid2eid_dev,
             moe_expert_gate_up_shared_batch2_t_k: gpu.kernel(
                 "moe_shared_expert_fused_batch2_t",
-                "moe_expert_gate_up_shared_batch2_t",
+                if crate::layers::ops::moe_batch2_v4() { "moe_expert_gate_up_shared_batch2_t_v4" } else { "moe_expert_gate_up_shared_batch2_t" },
             )?,
             moe_expert_silu_down_shared_batch2_t_k: gpu.kernel(
                 "moe_shared_expert_fused_batch2_t",
-                "moe_expert_silu_down_shared_batch2_t",
+                if crate::layers::ops::moe_batch2_v4() { "moe_expert_silu_down_shared_batch2_t_v4" } else { "moe_expert_silu_down_shared_batch2_t" },
             )?,
             moe_expert_gate_up_shared_batch3_t_k: gpu.kernel(
                 "moe_shared_expert_fused_batch3_t",

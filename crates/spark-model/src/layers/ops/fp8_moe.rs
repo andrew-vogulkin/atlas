@@ -343,8 +343,9 @@ pub fn moe_expert_gate_up_shared_t(
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(n, T_BLOCK), top_k + 1, 2])
+        .grid([super::fp8_moe_batch_a::b2_grid_x(n)?, top_k + 1, 2])
         .block([T_BLOCK, 1, 1])
+        .shared_mem(if super::fp8_moe_batch_a::moe_batch2_v4() { k * 4 } else { 0 })
         .arg_ptr(input)
         .arg_ptr(gate_packed_t_ptrs)
         .arg_ptr(gate_scale_t_ptrs)
@@ -392,7 +393,7 @@ pub fn moe_expert_silu_down_shared_t(
 ) -> Result<()> {
     let smem_bytes = (k as usize * std::mem::size_of::<f32>()) as u32;
     KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(n, T_BLOCK), top_k + 1, 1])
+        .grid([super::fp8_moe_batch_a::b2_grid_x(n)?, top_k + 1, 1])
         .block([T_BLOCK, 1, 1])
         .shared_mem(smem_bytes)
         .arg_ptr(gate_out)

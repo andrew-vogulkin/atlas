@@ -13,6 +13,23 @@ use crate::weight_map::{DenseWeight, Fp8DenseWeight, Fp8Weight, QuantizedWeight}
 
 use super::*;
 
+/// Speed pass 2026-09-29: the K=2 transposed NVFP4 expert GEMVs use the
+/// `_v4` kernels (4 columns per thread, uchar4 loads; same per-column math).
+/// `ATLAS_MOE_B2_V4=0` restores the byte-per-thread kernels.
+pub fn moe_batch2_v4() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("ATLAS_MOE_B2_V4").as_deref() != Ok("0"))
+}
+
+pub(super) fn b2_grid_x(n: u32) -> Result<u32> {
+    if moe_batch2_v4() {
+        anyhow::ensure!(n.is_multiple_of(T_BLOCK * 4), "moe batch2 v4: N={n} not a multiple of {}", T_BLOCK * 4);
+        Ok(n / (T_BLOCK * 4))
+    } else {
+        Ok(div_ceil(n, T_BLOCK))
+    }
+}
+
 /// NVFP4 fused gate+up GEMV (transposed). K=2 batch.
 #[allow(clippy::too_many_arguments)]
 pub fn moe_expert_gate_up_shared_batch2_t(
@@ -38,8 +55,9 @@ pub fn moe_expert_gate_up_shared_batch2_t(
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(n, T_BLOCK), 2 * (top_k + 1), 2])
+        .grid([b2_grid_x(n)?, 2 * (top_k + 1), 2])
         .block([T_BLOCK, 1, 1])
+        .shared_mem(if moe_batch2_v4() { k * 4 } else { 0 })
         .arg_ptr(input)
         .arg_ptr(gate_packed_t_ptrs)
         .arg_ptr(gate_scale_t_ptrs)
@@ -87,7 +105,7 @@ pub fn moe_expert_silu_down_shared_batch2_t(
 ) -> Result<()> {
     let smem_bytes = (k as usize * std::mem::size_of::<f32>()) as u32;
     KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(n, T_BLOCK), 2 * (top_k + 1), 1])
+        .grid([b2_grid_x(n)?, 2 * (top_k + 1), 1])
         .block([T_BLOCK, 1, 1])
         .shared_mem(smem_bytes)
         .arg_ptr(gate_out)
