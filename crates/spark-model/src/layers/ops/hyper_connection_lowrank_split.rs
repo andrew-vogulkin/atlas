@@ -27,12 +27,101 @@ pub(super) fn hc_pre_split(
     inject: bool,
     stream: u64,
 ) -> Result<()> {
-    let hc_dim = hc_mult * hidden_size;
     // Scratch layout: normed [T<=64, hc_dim] then low [T<=64, rank], F32.
     let normed = scratch;
-    let low = scratch.offset(64 * hc_dim as usize * 4);
 
     let k_stage = gpu.kernel("hyper_connection", "hc_pre_stage")?;
+
+    KernelLaunch::new(gpu, k_stage)
+        .grid([num_tokens, if num_tokens <= 8 { hc_mult } else { 1 }, 1])
+        .block([1024, 1, 1])
+        .arg_ptr(streams)
+        .arg_ptr(w.norm_w)
+        .arg_ptr(normed)
+        .arg_u32(hidden_size)
+        .arg_u32(hc_mult)
+        .arg_f32(norm_eps)
+        .launch(stream)?;
+
+    hc_pre_split_rest(
+        gpu,
+        w,
+        y_out,
+        inj_out,
+        scratch,
+        num_tokens,
+        hidden_size,
+        hc_mult,
+        inject,
+        stream,
+    )
+}
+
+/// `hc_post` + `hc_pre_split` for one site boundary, with the post and the
+/// stage fused into `hc_post_stage` (round-2 item 4): the post values stay in
+/// registers instead of a global write + immediate re-read. Same geometry and
+/// per-lane arithmetic as `hc_pre_stage` at small T, so bitwise identical.
+/// Caller guarantees `num_tokens <= 8`, non-null scratch, H <= 4096.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn hc_post_pre_split(
+    gpu: &dyn GpuBackend,
+    block_out: DevicePtr,
+    streams: DevicePtr,
+    inj: DevicePtr,
+    w: &HcLowRank,
+    y_out: DevicePtr,
+    inj_out: DevicePtr,
+    scratch: DevicePtr,
+    num_tokens: u32,
+    hidden_size: u32,
+    hc_mult: u32,
+    norm_eps: f32,
+    stream: u64,
+) -> Result<()> {
+    let k = gpu.kernel("hyper_connection", "hc_post_stage")?;
+    KernelLaunch::new(gpu, k)
+        .grid([num_tokens, hc_mult, 1])
+        .block([1024, 1, 1])
+        .arg_ptr(block_out)
+        .arg_ptr(streams)
+        .arg_ptr(inj)
+        .arg_ptr(w.norm_w)
+        .arg_ptr(scratch)
+        .arg_u32(hidden_size)
+        .arg_u32(hc_mult)
+        .arg_f32(norm_eps)
+        .launch(stream)?;
+    hc_pre_split_rest(
+        gpu,
+        w,
+        y_out,
+        inj_out,
+        scratch,
+        num_tokens,
+        hidden_size,
+        hc_mult,
+        true,
+        stream,
+    )
+}
+
+/// Stages 2 and 3 of the split collapse (`normed` already in scratch).
+#[allow(clippy::too_many_arguments)]
+fn hc_pre_split_rest(
+    gpu: &dyn GpuBackend,
+    w: &HcLowRank,
+    y_out: DevicePtr,
+    inj_out: DevicePtr,
+    scratch: DevicePtr,
+    num_tokens: u32,
+    hidden_size: u32,
+    hc_mult: u32,
+    inject: bool,
+    stream: u64,
+) -> Result<()> {
+    let hc_dim = hc_mult * hidden_size;
+    let normed = scratch;
+    let low = scratch.offset(64 * hc_dim as usize * 4);
     // Two shapes of the same math. `hc_pre_down` stages the whole 40 KB
     // `normed` row and makes one pass -- right for decode (T=1), where a single
     // pass costs no barriers. `hc_pre_down_tiled` tiles tokens and chunks
@@ -46,17 +135,6 @@ pub(super) fn hc_pre_split(
     let k_down = gpu.kernel("hyper_connection", "hc_pre_down")?;
     let k_down_tiled = gpu.kernel("hyper_connection", "hc_pre_down_tiled")?;
     let k_fin = gpu.kernel("hyper_connection", "hc_pre_finish")?;
-
-    KernelLaunch::new(gpu, k_stage)
-        .grid([num_tokens, 1, 1])
-        .block([1024, 1, 1])
-        .arg_ptr(streams)
-        .arg_ptr(w.norm_w)
-        .arg_ptr(normed)
-        .arg_u32(hidden_size)
-        .arg_u32(hc_mult)
-        .arg_f32(norm_eps)
-        .launch(stream)?;
 
     // `hc_pre_down` stages the token's `normed` row in SHARED memory, so the
     // 40 KB vector is read once per block instead of once per `rank` row. That
@@ -109,10 +187,12 @@ pub(super) fn hc_pre_split(
             HC_SMEM_MAX,
             hc_dim,
         );
-        let dsplit = (48 / num_tokens.max(1)).clamp(1, 10);
+        // One warp per rank row, 8 warps per block: spreads the 320 rows over
+        // 40 SMs instead of 10 (was 32 warps x 10 blocks). Per-row math unchanged.
+        let dsplit = (w.rank as u32).div_ceil(8).max(1);
         KernelLaunch::new(gpu, k_down)
             .grid([num_tokens, dsplit, 1])
-            .block([1024, 1, 1])
+            .block([256, 1, 1])
             .shared_mem(hc_smem as u32)
             .arg_ptr(normed)
             .arg_ptr(w.down_w)
@@ -162,7 +242,8 @@ pub(super) fn hc_pre_split(
     let (k_fin, grid_y, fblock) = if x4 {
         (
             gpu.kernel("hyper_connection", "hc_pre_finish_x4")?,
-            hidden_size.div_ceil(32),
+            // +1: the last y-block does only the injection contraction.
+            hidden_size.div_ceil(32) + 1,
             128,
         )
     } else {
@@ -186,4 +267,55 @@ pub(super) fn hc_pre_split(
         .arg_u32(hc_mult)
         .arg_u32(w.rank as u32)
         .launch(stream)
+}
+
+/// Whether `hc_post_pre_lowrank` can take the fused single-launch path:
+/// decode-shaped T, the split collapse's scratch present, H within the fused
+/// kernel's register budget (4 x 1024 lanes). `ATLAS_HC_POST_FUSE=0` is the
+/// kill switch back to the two-kernel sequence.
+pub fn hc_post_pre_fusable(num_tokens: u32, hidden_size: u32, scratch: DevicePtr) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_HC_POST_FUSE").map_or(true, |v| v != "0"))
+        && num_tokens <= super::hyper_connection_lowrank::HC_DECODE_MAX_T
+        && !scratch.is_null()
+        && hidden_size <= 4 * 1024
+}
+
+/// Fused `hc_post_lowrank` (in place on `streams`) + `hc_pre_lowrank` of the
+/// NEXT site over the same streams. Caller checks `hc_post_pre_fusable`.
+#[allow(clippy::too_many_arguments)]
+pub fn hc_post_pre_lowrank(
+    gpu: &dyn GpuBackend,
+    block_out: DevicePtr,
+    streams: DevicePtr,
+    inj: DevicePtr,
+    w: &HcLowRank,
+    y_out: DevicePtr,
+    inj_out: DevicePtr,
+    scratch: DevicePtr,
+    num_tokens: u32,
+    hidden_size: u32,
+    hc_mult: u32,
+    norm_eps: f32,
+    stream: u64,
+) -> Result<()> {
+    anyhow::ensure!(
+        !w.inject_w.is_null(),
+        "hc_post_pre_lowrank needs block_inject_weight"
+    );
+    hc_post_pre_split(
+        gpu,
+        block_out,
+        streams,
+        inj,
+        w,
+        y_out,
+        inj_out,
+        scratch,
+        num_tokens,
+        hidden_size,
+        hc_mult,
+        norm_eps,
+        stream,
+    )
 }

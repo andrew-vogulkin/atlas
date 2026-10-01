@@ -21,6 +21,15 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        self.forward_k2_routed(input, ctx, stream)
+    }
+
+    fn forward_k2_routed(
+        &self,
+        input: DevicePtr, // [2, H] BF16 — normed MoE input for 2 tokens
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
         // LongCat zero-experts are wired only on the single-token decode
         // + prefill paths (v1); this variant would silently mis-route the
         // 384-wide router. Named refusal, not silent wrongness.

@@ -174,6 +174,78 @@ pub fn hc_post_site(
     }
 }
 
+/// `hc_post_site` (in place: `streams` is both residual and out) followed by
+/// `hc_pre_site` for `next` over the same streams. On the low-rank variant at
+/// decode-shaped T this is ONE fused launch instead of two, bitwise identical
+/// (round-2 item 4); every other case runs the two calls unchanged.
+/// `post` is read as the injection vector, then overwritten as `post_out`.
+#[allow(clippy::too_many_arguments)]
+pub fn hc_post_pre_site(
+    gpu: &dyn GpuBackend,
+    post_kernel: KernelHandle,
+    pre_kernel: KernelHandle,
+    hc: &HcWeights,
+    next: &HcSiteWeights,
+    block_out: DevicePtr,
+    streams: DevicePtr,
+    y_out: DevicePtr,
+    post: DevicePtr,
+    comb: DevicePtr,
+    scratch: DevicePtr,
+    num_tokens: u32,
+    hidden_size: u32,
+    norm_eps: f32,
+    stream: u64,
+) -> Result<()> {
+    if let (HcVariant::LowRank, Some(w)) = (HcVariant::of(hc), &next.lowrank)
+        && lowrank::hc_post_pre_fusable(num_tokens, hidden_size, scratch)
+    {
+        return lowrank::hc_post_pre_lowrank(
+            gpu,
+            block_out,
+            streams,
+            post,
+            w,
+            y_out,
+            post,
+            scratch,
+            num_tokens,
+            hidden_size,
+            hc.hc_mult as u32,
+            norm_eps,
+            stream,
+        );
+    }
+    hc_post_site(
+        gpu,
+        post_kernel,
+        hc,
+        block_out,
+        streams,
+        post,
+        comb,
+        streams,
+        num_tokens,
+        hidden_size,
+        stream,
+    )?;
+    hc_pre_site(
+        gpu,
+        pre_kernel,
+        streams,
+        next,
+        hc,
+        y_out,
+        post,
+        comb,
+        scratch,
+        num_tokens,
+        hidden_size,
+        norm_eps,
+        stream,
+    )
+}
+
 /// The model-level final collapse before the LM head.
 ///
 /// On Qwen this is ALSO the model's final normalization — the checkpoint

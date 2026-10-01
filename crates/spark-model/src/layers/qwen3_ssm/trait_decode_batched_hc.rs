@@ -258,30 +258,17 @@ impl Qwen3SsmLayer {
         // `ctx.buffers.moe_output()`, which the FFN below overwrites. Consuming
         // it into the highway first is what makes that safe — same ordering
         // constraint `trait_prefill_hc` documents.
-        ops::hc_post_site(
+        // hc_post (attn -> streams) + the FFN's hc_pre, fused into one launch
+        // on the low-rank decode path (round-2 item 4, ATLAS_HC_POST_FUSE=0 off).
+        let normed2 = ctx.buffers.norm_output();
+        ops::hc_post_pre_site(
             ctx.gpu,
             self.hc_post_k,
+            self.hc_pre_k,
             hc,
+            &hc.ffn,
             out_proj_buf,
             streams,
-            post,
-            comb,
-            streams,
-            n,
-            h as u32,
-            stream,
-        )?;
-
-        stage!("hc_post_attn");
-
-        // ── MoE sublayer ──
-        let normed2 = ctx.buffers.norm_output();
-        ops::hc_pre_site(
-            ctx.gpu,
-            self.hc_pre_k,
-            streams,
-            &hc.ffn,
-            hc,
             normed2,
             post,
             comb,
@@ -295,8 +282,9 @@ impl Qwen3SsmLayer {
         // The batched MoE arms all leave `[num_tokens, h]` in `moe_output`,
         // which is what `hc_post` needs. The non-hc path's per-token fallback
         // does NOT: `ffn.forward` reuses row 0 every call, so it would need
-        // per-row staging. Rather than stage it subtly wrong, refuse — K=2 (the
-        // num_drafts=1 verify) and K=3 are the widths this model actually runs.
+        // per-row staging. K=2 (the num_drafts=1 verify) and K=3 have their own
+        // arms; K>3 (several sequences verified together) goes through
+        // `moe_fallback_arm`, and anything without an arm is refused.
         stage!("hc_pre_ffn");
 
         if num_tokens == 3 {
@@ -311,15 +299,44 @@ impl Qwen3SsmLayer {
                 .unwrap_or(false)
         {
             // try_forward_km already wrote moe_output for all rows.
-        } else if self.ffn.is_dense() {
-            self.ffn.forward_prefill(normed2, num_tokens, ctx, stream)?;
         } else {
-            anyhow::bail!(
-                "qwen3_ssm mHC batched decode: no batched MoE arm for K={num_tokens}. \
-                 K=2/3 use forward_k2/k3 and K=4..8 the batched GEMV; this model's \
-                 512-expert MoE has no per-row staging under the highway yet. \
-                 Lower --num-drafts (K = num_drafts + 1)."
-            );
+            match moe_fallback_arm(num_tokens, self.ffn.is_dense()) {
+                Some(MoeFallbackArm::Dense) => {
+                    self.ffn.forward_prefill(normed2, num_tokens, ctx, stream)?;
+                }
+                Some(MoeFallbackArm::PairwiseK2) => {
+                    // Multi-sequence verify (e.g. 2 seqs x K=2 -> K=4). Run the
+                    // K=2 arm once per row pair. With num_drafts=1 every sequence
+                    // contributes exactly 2 rows, so each pair is one sequence
+                    // and its numerics are those of a solo verify. forward_k2
+                    // writes only moe_output rows 0..2, so pair 0 must run last;
+                    // every other pair's result is moved up to its own rows.
+                    let row = ctx.config.hidden_size * 2; // bf16 bytes per row
+                    let out = ctx.buffers.moe_output();
+                    for pair in k2_pair_order(num_tokens) {
+                        self.ffn
+                            .forward_k2(normed2.offset(pair * 2 * row), ctx, stream)?;
+                        if pair > 0 {
+                            ctx.gpu.copy_d2d_async(
+                                out,
+                                out.offset(pair * 2 * row),
+                                2 * row,
+                                stream,
+                            )?;
+                        }
+                    }
+                }
+                Some(MoeFallbackArm::PerToken) => {
+                    // Odd widths (uneven per-sequence K): the general per-token
+                    // batched MoE path writes all [num_tokens, h] rows.
+                    self.ffn.forward_batched(normed2, num_tokens, ctx, stream)?;
+                }
+                None => anyhow::bail!(
+                    "qwen3_ssm mHC batched decode: no batched MoE arm for K={num_tokens}. \
+                     K=2/3 use forward_k2/k3, K=4..8 the batched GEMV, and K>3 the \
+                     pairwise K=2 or per-token arms. Lower --num-drafts (K = num_drafts + 1)."
+                ),
+            }
         }
         stage!("moe");
 
@@ -360,3 +377,39 @@ fn verify_prof_start(ctx: &ForwardContext, stream: u64) -> Option<std::time::Ins
     ctx.gpu.synchronize(stream).ok();
     Some(std::time::Instant::now())
 }
+
+/// MoE arm for a `num_tokens`-row mHC batched decode once the K=2 / K=3 arms
+/// and the K=4..8 batched GEMV (`try_forward_km`) did not take it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MoeFallbackArm {
+    /// Dense FFN: the prefill path handles any width.
+    Dense,
+    /// Even K>3 (two or more num_drafts=1 sequences): `forward_k2` per row pair.
+    PairwiseK2,
+    /// Odd K>3 (uneven per-sequence K): `MoeLayer::forward_batched`.
+    PerToken,
+}
+
+/// `None` means no arm exists and the caller must refuse the batch.
+pub(super) fn moe_fallback_arm(num_tokens: usize, is_dense: bool) -> Option<MoeFallbackArm> {
+    if is_dense {
+        Some(MoeFallbackArm::Dense)
+    } else if num_tokens > 3 && num_tokens.is_multiple_of(2) {
+        Some(MoeFallbackArm::PairwiseK2)
+    } else if num_tokens > 3 {
+        Some(MoeFallbackArm::PerToken)
+    } else {
+        None
+    }
+}
+
+/// Order the row pairs run in for [`MoeFallbackArm::PairwiseK2`]. `forward_k2`
+/// writes `moe_output` rows 0..2, so pair 0 has to run last: run earlier, it
+/// would be clobbered by the next pair's result.
+pub(super) fn k2_pair_order(num_tokens: usize) -> impl Iterator<Item = usize> {
+    (0..num_tokens / 2).rev()
+}
+
+#[cfg(test)]
+#[path = "trait_decode_batched_hc_tests.rs"]
+mod moe_arm_tests;

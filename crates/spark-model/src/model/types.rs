@@ -323,6 +323,12 @@ pub struct TransformerModel {
     /// concurrent users alternating through MTP verify, a single
     /// `Option<GraphHandle>` would corrupt both slots' SSM state.
     pub(super) verify2_graph: Mutex<std::collections::HashMap<usize, GraphHandle>>,
+    /// Segmented K=2 verify graphs (`verify_seg.rs`), keyed by `seq.slot_idx`:
+    /// one entry per GDN run between attention layers plus the tail. Each
+    /// entry bakes the slot's SSM pool pointers AND the occupant's PLE carry,
+    /// so it MUST be dropped in `invalidate_slot_graphs` / compaction.
+    pub(super) verify_segment_graphs:
+        Mutex<std::collections::HashMap<usize, super::trait_impl::verify_seg::SegGraphs>>,
     /// Cached CUDA graphs for K=3 verification, keyed by `seq.slot_idx`.
     pub(super) verify3_graph: Mutex<std::collections::HashMap<usize, GraphHandle>>,
     /// Cached CUDA graphs for K=4 verification, keyed by `seq.slot_idx`.

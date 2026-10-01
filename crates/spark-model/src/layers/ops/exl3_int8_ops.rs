@@ -26,7 +26,7 @@ use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 
 use crate::weight_map::exl3::Exl3Weight;
 
-use super::exl3_ops::{Exl3Kernels, exl3_convert};
+use super::exl3_ops::Exl3Kernels;
 
 /// Max k-split of the sq decomposition.
 const SQ_KSPLIT_CAP: u32 = 64;
@@ -117,6 +117,8 @@ pub fn sq_grid(sm_count: u32) -> u32 {
 pub struct Exl3Int8Kernels {
     /// The sq GEMV entries: index = `[bits - 4][m - 1]`.
     pub sq: [[KernelHandle; 2]; 3],
+    /// The same GEMVs with bf16 input and bf16-rows output folded in (`*_bf16`).
+    pub sq_bf16: [[KernelHandle; 2]; 3],
     /// f32 -> bf16 grid-stride conversion, for the bf16 linear's epilogue.
     pub f32_to_bf16: KernelHandle,
     /// f32 [rows, cols] → bf16 rows at `out_stride` elements apart (M6d batched verify).
@@ -126,11 +128,27 @@ pub struct Exl3Int8Kernels {
 impl Exl3Int8Kernels {
     pub fn resolve(gpu: &dyn GpuBackend) -> Result<Self> {
         let k = |name: &str| gpu.kernel("exl3_int8", name);
+        // R2 vocab-l2 item B: L2 cache-policy hint on the K4/K5 trellis weight stream.
+        // Default on: evict_first. ATLAS_SQ_L2HINT = 0|off (kill switch: original kernels) | last (evict_last).
+        let suf = match std::env::var("ATLAS_SQ_L2HINT").as_deref() {
+            Ok("0") | Ok("off") => "",
+            Ok("last") => "_l2l",
+            _ => "_l2f",
+        };
+        let h = |name: &str| gpu.kernel("exl3_int8", &format!("{name}{suf}"));
+        if !suf.is_empty() {
+            tracing::info!("exl3 sq GEMV: L2 weight-stream hint {suf}");
+        }
         Ok(Self {
             sq: [
-                [k("exl3_int8_sq_k4_m1")?, k("exl3_int8_sq_k4_m2")?],
-                [k("exl3_int8_sq_k5_m1")?, k("exl3_int8_sq_k5_m2")?],
+                [h("exl3_int8_sq_k4_m1")?, h("exl3_int8_sq_k4_m2")?],
+                [h("exl3_int8_sq_k5_m1")?, h("exl3_int8_sq_k5_m2")?],
                 [k("exl3_int8_sq_k6_m1")?, k("exl3_int8_sq_k6_m2")?],
+            ],
+            sq_bf16: [
+                [h("exl3_int8_sq_k4_m1_bf16")?, h("exl3_int8_sq_k4_m2_bf16")?],
+                [h("exl3_int8_sq_k5_m1_bf16")?, h("exl3_int8_sq_k5_m2_bf16")?],
+                [k("exl3_int8_sq_k6_m1_bf16")?, k("exl3_int8_sq_k6_m2_bf16")?],
             ],
             f32_to_bf16: k("exl3_f32_to_bf16")?,
             f32_to_bf16_rows: k("exl3_f32_to_bf16_rows")?,
@@ -249,16 +267,74 @@ pub fn exl3_int8_linear_bf16_rows(
     grid: u32,
     stream: u64,
 ) -> Result<()> {
+    // B3: one launch. The bf16 -> f16 input conversion and the f32 -> bf16
+    // row output are folded into the sq kernel (`*_bf16` entries) with the
+    // exact ops of the removed launches; grid and decomposition unchanged.
     let (kdim, n) = (w.shape.in_features, w.shape.out_features);
-    exl3_convert(
-        gpu,
-        k.bf16_to_f16,
-        x_bf16,
-        x_f16,
-        (m as usize * kdim) as u32,
-        stream,
-    )?;
-    exl3_int8_gemv(gpu, k8, ws, x_f16, m, w, a_had, c_f32, grid, stream)?;
+    // Keep the staged 3-launch path when the fused kernel's write order would
+    // matter: (a) `out` aliases `x` (the kernel reads `x` while other blocks
+    // already write `out`); (b) rows overlap (`out_stride < n`, e.g. the lm_head
+    // writes padded-vocab rows 248320 wide at a 248077 stride). The old
+    // grid-stride converter lets row 1 deterministically overwrite row 0's
+    // padded tail; the fused epilogue's column-group completion order is not
+    // fixed, so it could clobber row 1's first logits.
+    let (xa, xb) = (x_bf16.0, x_bf16.0 + (m as u64 * kdim as u64) * 2);
+    let (oa, ob) = (
+        out_bf16.0,
+        out_bf16.0 + ((m as u64 - 1) * out_stride as u64 + n as u64) * 2,
+    );
+    if (xa < ob && oa < xb) || (m > 1 && out_stride < n) {
+        super::exl3_ops::exl3_convert(
+            gpu,
+            k.bf16_to_f16,
+            x_bf16,
+            x_f16,
+            (m as usize * kdim) as u32,
+            stream,
+        )?;
+        exl3_int8_gemv(gpu, k8, ws, x_f16, m, w, a_had, c_f32, grid, stream)?;
+        return exl3_f32_to_bf16_rows(gpu, k8, c_f32, out_bf16, m, n, out_stride, stream);
+    }
+    let plan = sq_plan(kdim, n, m, w.shape.bits, grid)?;
+    anyhow::ensure!(
+        ws.ints >= plan.ws_ints,
+        "EXL3 int8 sq: workspace has {} ints, this call needs {}",
+        ws.ints,
+        plan.ws_ints
+    );
+    KernelLaunch::new(gpu, k8.sq_bf16[w.shape.bits as usize - 4][m as usize - 1])
+        .grid([plan.grid, 1, 1])
+        .block([256, 1, 1])
+        .shared_mem(plan.smem)
+        .arg_ptr(x_bf16)
+        .arg_ptr(w.trellis)
+        .arg_ptr(out_bf16)
+        .arg_i32(m as i32)
+        .arg_i32(kdim as i32)
+        .arg_i32(n as i32)
+        .arg_ptr(ws.ptr)
+        .arg_ptr(w.suh)
+        .arg_ptr(a_had)
+        .arg_ptr(w.svh)
+        .arg_i32(out_stride as i32)
+        .launch(stream)
+}
+
+/// f32 `[m, n]` -> bf16 rows `out_stride` elements apart. Columns at or past
+/// `out_stride` are dropped: the lm_head is packed `n = 248320` wide (padded)
+/// but its logits rows are `vocab = 248077` apart, so a padded row must not
+/// spill into the next one.
+#[allow(clippy::too_many_arguments)]
+pub fn exl3_f32_to_bf16_rows(
+    gpu: &dyn GpuBackend,
+    k8: &Exl3Int8Kernels,
+    c_f32: DevicePtr,
+    out_bf16: DevicePtr,
+    m: u32,
+    n: usize,
+    out_stride: usize,
+    stream: u64,
+) -> Result<()> {
     KernelLaunch::new(gpu, k8.f32_to_bf16_rows)
         .grid([div_ceil(m * n as u32, 256).min(1024), 1, 1])
         .block([256, 1, 1])

@@ -413,3 +413,162 @@ extern "C" __global__ void moe_expert_silu_down_shared_t_e8m0(
         expert_indices, sh_gate_in, sh_up_in, sh_down_t_packed, sh_down_t_scale,
         sh_down_s2, sh_down_out, N, K, top_k);
 }
+
+// ── VEC4 single-token variants (speed pass 2026-09-29) ────────────────────
+// NVFP4-only siblings of moe_expert_{gate_up,silu_down}_shared_t: four output
+// columns per thread (uchar4 loads, 128 B per warp request) and GD groups of
+// loads issued ahead. Per-column FMA order and expression are unchanged, so
+// results are bitwise identical. Host requires N % 128 == 0; grid.x = N/128.
+template <bool FROM_SMEM>
+__device__ __forceinline__ void t_v4_accum(
+    const unsigned char* __restrict__ B_packed, const unsigned char* __restrict__ B_scale, float s2,
+    const __nv_bfloat16* __restrict__ A, const float* s_act, const float* s_lut,
+    unsigned int N, unsigned int K, unsigned int n0, float acc[4])
+{
+    const unsigned int num_groups = K / GROUP_SIZE;
+    constexpr unsigned int GD = 4;
+    unsigned int sg = 0;
+    for (; sg < num_groups; sg += GD) {
+        const unsigned int gcount = (num_groups - sg) < GD ? (num_groups - sg) : GD;
+        uchar4 sbv[GD];
+        uchar4 bv[GD * 8];
+        #pragma unroll
+        for (unsigned int g = 0; g < GD; ++g) {
+            if (g < gcount) {
+                sbv[g] = *(const uchar4*)(B_scale + (unsigned long long)(sg + g) * N + n0);
+                #pragma unroll
+                for (unsigned int kh = 0; kh < 8; kh++)
+                    bv[g * 8 + kh] = *(const uchar4*)(B_packed + (unsigned long long)((sg + g) * 8 + kh) * N + n0);
+            }
+        }
+        #pragma unroll
+        for (unsigned int g = 0; g < GD; ++g) {
+            if (g < gcount) {
+                const float sc0 = mx_block_scale<false>(sbv[g].x, s2);
+                const float sc1 = mx_block_scale<false>(sbv[g].y, s2);
+                const float sc2 = mx_block_scale<false>(sbv[g].z, s2);
+                const float sc3 = mx_block_scale<false>(sbv[g].w, s2);
+                #pragma unroll
+                for (unsigned int kh = 0; kh < 8; kh++) {
+                    const unsigned int k_half = (sg + g) * 8 + kh;
+                    float a_lo, a_hi;
+                    if (FROM_SMEM) { a_lo = s_act[k_half * 2]; a_hi = s_act[k_half * 2 + 1]; }
+                    else { a_lo = __bfloat162float(A[k_half * 2]); a_hi = __bfloat162float(A[k_half * 2 + 1]); }
+                    const uchar4 b = bv[g * 8 + kh];
+                    acc[0] += a_lo * (s_lut[b.x & 0xFu] * sc0) + a_hi * (s_lut[(b.x >> 4) & 0xFu] * sc0);
+                    acc[1] += a_lo * (s_lut[b.y & 0xFu] * sc1) + a_hi * (s_lut[(b.y >> 4) & 0xFu] * sc1);
+                    acc[2] += a_lo * (s_lut[b.z & 0xFu] * sc2) + a_hi * (s_lut[(b.z >> 4) & 0xFu] * sc2);
+                    acc[3] += a_lo * (s_lut[b.w & 0xFu] * sc3) + a_hi * (s_lut[(b.w >> 4) & 0xFu] * sc3);
+                }
+            }
+        }
+    }
+}
+
+__device__ __forceinline__ void t_v4_store(__nv_bfloat16* C, unsigned int n0, unsigned int N, const float acc[4]) {
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) if (n0 + j < N) C[n0 + j] = __float2bfloat16(acc[j]);
+}
+
+extern "C" __global__ void moe_expert_gate_up_shared_t_v4(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned long long* __restrict__ gate_packed_t_ptrs,
+    const unsigned long long* __restrict__ gate_scale_t_ptrs,
+    const float* __restrict__ gate_scale2_vals,
+    __nv_bfloat16* __restrict__ gate_out,
+    const unsigned long long* __restrict__ up_packed_t_ptrs,
+    const unsigned long long* __restrict__ up_scale_t_ptrs,
+    const float* __restrict__ up_scale2_vals,
+    __nv_bfloat16* __restrict__ up_out,
+    const unsigned int* __restrict__ expert_indices,
+    const unsigned char* __restrict__ sh_gate_t_packed,
+    const unsigned char* __restrict__ sh_gate_t_scale,
+    float sh_gate_s2,
+    __nv_bfloat16* __restrict__ sh_gate_out,
+    const unsigned char* __restrict__ sh_up_t_packed,
+    const unsigned char* __restrict__ sh_up_t_scale,
+    float sh_up_s2,
+    __nv_bfloat16* __restrict__ sh_up_out,
+    unsigned int N, unsigned int K, unsigned int top_k
+) {
+    const unsigned int expert_slot = blockIdx.y;
+    const unsigned int proj = blockIdx.z;
+    const bool is_shared = (expert_slot == top_k);
+    const unsigned int n0 = (blockIdx.x * BLOCK_SIZE + threadIdx.x) * 4;
+    const unsigned char* B_packed; const unsigned char* B_scale; float s2; __nv_bfloat16* C;
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (is_shared) {
+        if (proj == 0) { B_packed = sh_gate_t_packed; B_scale = sh_gate_t_scale; s2 = sh_gate_s2; C = sh_gate_out; }
+        else { B_packed = sh_up_t_packed; B_scale = sh_up_t_scale; s2 = sh_up_s2; C = sh_up_out; }
+    } else {
+        const unsigned int expert_id = expert_indices[expert_slot];
+        if (proj == 0) {
+            B_packed = (const unsigned char*)gate_packed_t_ptrs[expert_id];
+            B_scale = (const unsigned char*)gate_scale_t_ptrs[expert_id];
+            s2 = gate_scale2_vals[expert_id]; C = gate_out;
+        } else {
+            B_packed = (const unsigned char*)up_packed_t_ptrs[expert_id];
+            B_scale = (const unsigned char*)up_scale_t_ptrs[expert_id];
+            s2 = up_scale2_vals[expert_id]; C = up_out;
+        }
+        C += (unsigned long long)expert_slot * N;
+    }
+    if (B_packed == 0) { t_v4_store(C, n0, N, acc); return; }
+    extern __shared__ float s_a_v4[];
+    for (unsigned int i = threadIdx.x; i < K; i += BLOCK_SIZE) s_a_v4[i] = __bfloat162float(A[i]);
+    __shared__ float s_lut[16];
+    if (threadIdx.x < 16) s_lut[threadIdx.x] = E2M1_LUT_T[threadIdx.x];
+    __syncthreads();
+    if (n0 >= N) return;
+    t_v4_accum<true>(B_packed, B_scale, s2, nullptr, s_a_v4, s_lut, N, K, n0, acc);
+    t_v4_store(C, n0, N, acc);
+}
+
+extern "C" __global__ void moe_expert_silu_down_shared_t_v4(
+    const __nv_bfloat16* __restrict__ gate_out,
+    const __nv_bfloat16* __restrict__ up_out,
+    const unsigned long long* __restrict__ packed_t_ptrs,
+    const unsigned long long* __restrict__ scale_t_ptrs,
+    const float* __restrict__ scale2_vals,
+    __nv_bfloat16* __restrict__ C,
+    const unsigned int* __restrict__ expert_indices,
+    const __nv_bfloat16* __restrict__ sh_gate_in,
+    const __nv_bfloat16* __restrict__ sh_up_in,
+    const unsigned char* __restrict__ sh_down_t_packed,
+    const unsigned char* __restrict__ sh_down_t_scale,
+    float sh_down_s2,
+    __nv_bfloat16* __restrict__ sh_down_out,
+    unsigned int N, unsigned int K, unsigned int top_k
+) {
+    const unsigned int expert_slot = blockIdx.y;
+    const bool is_shared = (expert_slot == top_k);
+    const unsigned int n0 = (blockIdx.x * BLOCK_SIZE + threadIdx.x) * 4;
+    const unsigned char* B_packed; const unsigned char* B_scale; float s2;
+    const __nv_bfloat16* g_ptr; const __nv_bfloat16* u_ptr; __nv_bfloat16* out;
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (is_shared) {
+        B_packed = sh_down_t_packed; B_scale = sh_down_t_scale; s2 = sh_down_s2;
+        g_ptr = sh_gate_in; u_ptr = sh_up_in; out = sh_down_out;
+    } else {
+        const unsigned int expert_id = expert_indices[expert_slot];
+        B_packed = (const unsigned char*)packed_t_ptrs[expert_id];
+        B_scale = (const unsigned char*)scale_t_ptrs[expert_id];
+        s2 = scale2_vals[expert_id];
+        g_ptr = gate_out + (unsigned long long)expert_slot * K;
+        u_ptr = up_out + (unsigned long long)expert_slot * K;
+        out = C + (unsigned long long)expert_slot * N;
+    }
+    if (B_packed == 0) { t_v4_store(out, n0, N, acc); return; }
+    extern __shared__ float s_act_v4[];
+    for (unsigned int i = threadIdx.x; i < K; i += BLOCK_SIZE) {
+        float gf = __bfloat162float(g_ptr[i]);
+        float uf = __bfloat162float(u_ptr[i]);
+        s_act_v4[i] = (gf / (1.0f + __expf(-gf))) * uf;
+    }
+    __shared__ float s_lut[16];
+    if (threadIdx.x < 16) s_lut[threadIdx.x] = E2M1_LUT_T[threadIdx.x];
+    __syncthreads();
+    if (n0 >= N) return;
+    t_v4_accum<true>(B_packed, B_scale, s2, nullptr, s_act_v4, s_lut, N, K, n0, acc);
+    t_v4_store(out, n0, N, acc);
+}

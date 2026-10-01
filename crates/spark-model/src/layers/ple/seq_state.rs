@@ -50,3 +50,13 @@ pub struct PleSeqState {
     /// tables, decode-only sequences, and `ATLAS_PLE_WARM=0`.
     pub(super) warm: Option<super::warm::PleWarm>,
 }
+
+impl PleSeqState {
+    /// The per-SEQUENCE device addresses a captured verify graph bakes in
+    /// (conv carry + verify snapshots). Used to fingerprint graph-cache
+    /// entries so a graph is never replayed against another sequence's
+    /// allocations.
+    pub fn baked_ptrs(&self) -> [u64; 2] {
+        [self.conv.0, self.verify_snaps.0]
+    }
+}
