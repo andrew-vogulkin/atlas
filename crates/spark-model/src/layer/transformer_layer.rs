@@ -149,6 +149,12 @@ pub trait TransformerLayer: Send + Sync {
         Ok(())
     }
 
+    /// Eager stream work that must follow a captured verify segment's launch
+    /// (e.g. PLE's pin event, which cannot be recorded inside a capture).
+    fn verify_graph_post_launch(&self, _gpu: &dyn GpuBackend, _stream: u64) -> Result<()> {
+        Ok(())
+    }
+
     /// Marconi aux state: host-serialized per-layer SEQUENCE state that must
     /// travel with an SSM snapshot for a prefix-cache hit to be complete —
     /// PLE's n-gram history + conv state, QSA's ingested indexer keys.

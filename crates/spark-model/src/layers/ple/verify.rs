@@ -105,7 +105,7 @@ impl PleLayer {
         stream: u64,
     ) -> Result<()> {
         let table_va = self.gather_host(ids, gpu, stream)?;
-        self.gather_embed(table_va, num_tokens, heads, gpu, stream)
+        self.gather_embed(table_va, num_tokens, heads, true, gpu, stream)
     }
 
     /// The HOST half of `gather`: NVMe fault-in + slot upload into the
@@ -212,10 +212,21 @@ impl PleLayer {
         table_va: u64,
         num_tokens: usize,
         heads: usize,
+        record: bool,
         gpu: &dyn GpuBackend,
         stream: u64,
     ) -> Result<()> {
         self.gather_embed_dispatch(table_va, num_tokens, heads, gpu, stream)?;
+        if record {
+            self.record_gather_done(gpu, stream)?;
+        }
+        Ok(())
+    }
+
+    /// Record the pin event behind everything enqueued so far on `stream`
+    /// (the gather kernel included). Called eagerly after a captured verify
+    /// segment is launched, since a record inside a capture is not real.
+    pub fn record_gather_done(&self, gpu: &dyn GpuBackend, stream: u64) -> Result<()> {
         // The pins taken by this gather must outlive THIS kernel: record an event
         // right behind it; `release_prev_pins` waits on it before freeing the slots.
         let mut ev = self

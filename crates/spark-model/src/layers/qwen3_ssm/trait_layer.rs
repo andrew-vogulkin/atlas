@@ -363,6 +363,13 @@ impl TransformerLayer for Qwen3SsmLayer {
         false
     }
 
+    fn verify_graph_post_launch(&self, gpu: &dyn GpuBackend, stream: u64) -> Result<()> {
+        if let Some(ple) = self.ple.as_ref() {
+            ple.record_gather_done(gpu, stream)?;
+        }
+        Ok(())
+    }
+
     fn verify_replay_host(&self, state: &mut dyn LayerState, k: usize) -> Result<()> {
         if let Some(ple) = self.ple.as_ref() {
             let ssm = state

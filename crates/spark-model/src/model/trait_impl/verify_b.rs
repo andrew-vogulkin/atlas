@@ -241,6 +241,23 @@ impl TransformerModel {
             && !k2_diag_eager
             && !lora_eager
             && !layer_veto;
+        // R6 item 3: when the whole-step graph is vetoed (QSA attention on
+        // this model), capture the GDN runs + tail as separate graphs and keep
+        // the attention layers eager. Same gating as `use_graphs` minus the
+        // model-wide veto; `ATLAS_VERIFY_SEG_GRAPHS=0` keeps today's path.
+        let seg_graphs = !use_graphs
+            && super::verify_seg::verify_seg_graphs_enabled()
+            && !super::verify_seg::seg_disabled()
+            && self.comm.is_none()
+            && !self
+                .suppress_graphs
+                .load(std::sync::atomic::Ordering::Relaxed)
+            && !hss_engaged
+            && !k2_diag_eager
+            && !lora_eager
+            && self.lora.is_none()
+            && seq.slot_idx < self.ssm_pool.max_slots
+            && self.seg_layers_ok();
 
         // DeepSeek-V4 hash-MoE (first `num_hash_layers`) routes experts by token
         // id via the static tid2eid table, so the verify forward needs the 2
@@ -294,6 +311,23 @@ impl TransformerModel {
             None
         };
 
+        if seg_graphs {
+            let ctx_cap = ForwardContext {
+                graph_capture: true,
+                midchunk_capture: None,
+                ..ctx
+            };
+            self.verify_k2_segmented(
+                seq,
+                &mut kv_cache,
+                &ctx,
+                &ctx_cap,
+                k,
+                hidden,
+                residual,
+                stream,
+            )?;
+        } else {
         // SLOT-KEYED LOOKUP: only replay if this seq's slot has a captured graph.
         let cached_for_slot = graph_cache
             .as_ref()
@@ -430,6 +464,7 @@ impl TransformerModel {
                 }
             }
         }
+        } // seg_graphs
 
         // ── Phase 3: Post-graph (D2H copy only) ──
 

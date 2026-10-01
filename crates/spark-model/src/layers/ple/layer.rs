@@ -287,7 +287,11 @@ impl PleLayer {
             // The host half already ran from `decode_prestage`, before graph
             // replay/capture: slots sit in `slots_dev`, history has advanced.
             // Only the capture-safe kernel half remains.
-            self.gather_embed(table_va, num_tokens, heads, gpu, stream)?;
+            // Under capture the pin event is recorded AFTER the graph launch
+            // (`record_gather_done`): an event recorded inside a capture
+            // region is not a real record, and the next `release_prev_pins`
+            // sync on it fails (cuEventSynchronize: invalid value).
+            self.gather_embed(table_va, num_tokens, heads, !ctx.graph_capture, gpu, stream)?;
         } else {
             anyhow::ensure!(
                 !ctx.graph_capture,
