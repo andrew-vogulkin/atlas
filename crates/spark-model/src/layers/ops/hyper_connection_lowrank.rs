@@ -43,13 +43,14 @@ use crate::layers::qwen3_attention::HcLowRank;
 /// A prefill is chunked (96 + tail here), so the TAIL chunk is what this gate
 /// decides: at 64 a 118-token prompt ran its 22-token tail on the split path
 /// for 27.7 ms of a 422 ms window.
-const HC_DECODE_MAX_T: u32 = 8;
+pub(super) const HC_DECODE_MAX_T: u32 = 8;
 
 /// `ATLAS_QWEN4EXP_NO_HC_GEMM=1`: revert the large-T collapse to the fused
 /// FP32 kernel (deploy-time kill switch; the GEMM path rounds `normed` to
 /// BF16 before the projections).
 use super::hyper_connection_lowrank_gemm::{gemm_raw, hc_gemm};
-use super::hyper_connection_lowrank_split::{hc_post_pre_split, hc_pre_split};
+use super::hyper_connection_lowrank_split::hc_pre_split;
+pub use super::hyper_connection_lowrank_split::{hc_post_pre_fusable, hc_post_pre_lowrank};
 
 fn hc_gemm_disabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -456,55 +457,4 @@ fn hc_pre_gemm(
         t0 += ts;
     }
     Ok(())
-}
-
-/// Whether `hc_post_pre_lowrank` can take the fused single-launch path:
-/// decode-shaped T, the split collapse's scratch present, H within the fused
-/// kernel's register budget (4 x 1024 lanes). `ATLAS_HC_POST_FUSE=0` is the
-/// kill switch back to the two-kernel sequence.
-pub fn hc_post_pre_fusable(num_tokens: u32, hidden_size: u32, scratch: DevicePtr) -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("ATLAS_HC_POST_FUSE").map_or(true, |v| v != "0"))
-        && num_tokens <= HC_DECODE_MAX_T
-        && !scratch.is_null()
-        && hidden_size <= 4 * 1024
-}
-
-/// Fused `hc_post_lowrank` (in place on `streams`) + `hc_pre_lowrank` of the
-/// NEXT site over the same streams. Caller checks `hc_post_pre_fusable`.
-#[allow(clippy::too_many_arguments)]
-pub fn hc_post_pre_lowrank(
-    gpu: &dyn GpuBackend,
-    block_out: DevicePtr,
-    streams: DevicePtr,
-    inj: DevicePtr,
-    w: &HcLowRank,
-    y_out: DevicePtr,
-    inj_out: DevicePtr,
-    scratch: DevicePtr,
-    num_tokens: u32,
-    hidden_size: u32,
-    hc_mult: u32,
-    norm_eps: f32,
-    stream: u64,
-) -> Result<()> {
-    anyhow::ensure!(
-        !w.inject_w.is_null(),
-        "hc_post_pre_lowrank needs block_inject_weight"
-    );
-    hc_post_pre_split(
-        gpu,
-        block_out,
-        streams,
-        inj,
-        w,
-        y_out,
-        inj_out,
-        scratch,
-        num_tokens,
-        hidden_size,
-        hc_mult,
-        norm_eps,
-        stream,
-    )
 }

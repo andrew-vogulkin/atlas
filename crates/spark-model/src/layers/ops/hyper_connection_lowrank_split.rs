@@ -268,3 +268,54 @@ fn hc_pre_split_rest(
         .arg_u32(w.rank as u32)
         .launch(stream)
 }
+
+/// Whether `hc_post_pre_lowrank` can take the fused single-launch path:
+/// decode-shaped T, the split collapse's scratch present, H within the fused
+/// kernel's register budget (4 x 1024 lanes). `ATLAS_HC_POST_FUSE=0` is the
+/// kill switch back to the two-kernel sequence.
+pub fn hc_post_pre_fusable(num_tokens: u32, hidden_size: u32, scratch: DevicePtr) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_HC_POST_FUSE").map_or(true, |v| v != "0"))
+        && num_tokens <= super::hyper_connection_lowrank::HC_DECODE_MAX_T
+        && !scratch.is_null()
+        && hidden_size <= 4 * 1024
+}
+
+/// Fused `hc_post_lowrank` (in place on `streams`) + `hc_pre_lowrank` of the
+/// NEXT site over the same streams. Caller checks `hc_post_pre_fusable`.
+#[allow(clippy::too_many_arguments)]
+pub fn hc_post_pre_lowrank(
+    gpu: &dyn GpuBackend,
+    block_out: DevicePtr,
+    streams: DevicePtr,
+    inj: DevicePtr,
+    w: &HcLowRank,
+    y_out: DevicePtr,
+    inj_out: DevicePtr,
+    scratch: DevicePtr,
+    num_tokens: u32,
+    hidden_size: u32,
+    hc_mult: u32,
+    norm_eps: f32,
+    stream: u64,
+) -> Result<()> {
+    anyhow::ensure!(
+        !w.inject_w.is_null(),
+        "hc_post_pre_lowrank needs block_inject_weight"
+    );
+    hc_post_pre_split(
+        gpu,
+        block_out,
+        streams,
+        inj,
+        w,
+        y_out,
+        inj_out,
+        scratch,
+        num_tokens,
+        hidden_size,
+        hc_mult,
+        norm_eps,
+        stream,
+    )
+}
