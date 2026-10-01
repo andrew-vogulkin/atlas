@@ -871,7 +871,8 @@ inline __device__ void had_ff_r_128_post_bf16
     const float* __restrict__ input_ptr,
     __nv_bfloat16* __restrict__ output_ptr,
     const half* __restrict__ scale,
-    const float r_scale
+    const float r_scale,
+    const int col_lim
 )
 {
     int t = threadIdx.x & 31;
@@ -903,10 +904,12 @@ inline __device__ void had_ff_r_128_post_bf16
         v.w *= __high2float(scales.y);
     }
     __nv_bfloat16* o = output_ptr + t * 4;
-    o[0] = __float2bfloat16_rn(v.x);
-    o[1] = __float2bfloat16_rn(v.y);
-    o[2] = __float2bfloat16_rn(v.z);
-    o[3] = __float2bfloat16_rn(v.w);
+    // Columns at or past out_stride are padding that would land in the next row: skip them.
+    int c = t * 4;
+    if (c + 0 < col_lim) o[0] = __float2bfloat16_rn(v.x);
+    if (c + 1 < col_lim) o[1] = __float2bfloat16_rn(v.y);
+    if (c + 2 < col_lim) o[2] = __float2bfloat16_rn(v.z);
+    if (c + 3 < col_lim) o[3] = __float2bfloat16_rn(v.w);
 }
 
 template <int M, bool residual, bool BF16IO = false>
@@ -1082,7 +1085,7 @@ __device__ __forceinline__ void gemv_int8_epilogue_group_sq
         tmp[lane * 4 + i] = k_inv * acc[i] + corr;
     __syncwarp();
     if constexpr (BF16IO)
-        had_ff_r_128_post_bf16(tmp, ((__nv_bfloat16*) C) + (size_t) row * out_stride + base, svh + base, 0.088388347648f);
+        had_ff_r_128_post_bf16(tmp, ((__nv_bfloat16*) C) + (size_t) row * out_stride + base, svh + base, 0.088388347648f, out_stride - base);
     else if constexpr (c_fp32)
         had_ff_r_128_inner<false, true>(tmp, ((float*) C) + (size_t) row * size_n + base, svh + base, 0.088388347648f);
     else
