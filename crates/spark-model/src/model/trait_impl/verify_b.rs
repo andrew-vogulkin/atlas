@@ -328,47 +328,86 @@ impl TransformerModel {
                 stream,
             )?;
         } else {
-        // SLOT-KEYED LOOKUP: only replay if this seq's slot has a captured graph.
-        let cached_for_slot = graph_cache
-            .as_ref()
-            .and_then(|c| c.get(&seq.slot_idx).copied());
-        if let Some(graph) = cached_for_slot
-            && graph.0 != 0
-        {
-            self.gpu.launch_graph(graph, stream)?;
-        }
-        let need_run = cached_for_slot.is_none();
-        if need_run {
-            let seq_lens_vec: Vec<usize> = (0..k).map(|t| seq.seq_len + t).collect();
-            let block_tables_vec: Vec<Vec<u32>> = vec![seq.block_table.clone(); k];
-
-            // Extract layer states. Attention layers use EmptyLayerState (no actual
-            // state), so sharing the same alloc is safe. For SSM layers, only one
-            // sequence's state exists — pass it to decode_batched directly.
-            if use_graphs {
-                self.gpu.begin_capture(stream)?;
+            // SLOT-KEYED LOOKUP: only replay if this seq's slot has a captured graph.
+            let cached_for_slot = graph_cache
+                .as_ref()
+                .and_then(|c| c.get(&seq.slot_idx).copied());
+            if let Some(graph) = cached_for_slot
+                && graph.0 != 0
+            {
+                self.gpu.launch_graph(graph, stream)?;
             }
+            let need_run = cached_for_slot.is_none();
+            if need_run {
+                let seq_lens_vec: Vec<usize> = (0..k).map(|t| seq.seq_len + t).collect();
+                let block_tables_vec: Vec<Vec<u32>> = vec![seq.block_table.clone(); k];
 
-            for (layer_idx, layer) in self.layers.iter().enumerate() {
-                let layer_type = self.config.layer_type(layer_idx);
+                // Extract layer states. Attention layers use EmptyLayerState (no actual
+                // state), so sharing the same alloc is safe. For SSM layers, only one
+                // sequence's state exists — pass it to decode_batched directly.
+                if use_graphs {
+                    self.gpu.begin_capture(stream)?;
+                }
 
-                if layer_type == LayerType::FullAttention {
-                    if hss_engaged {
-                        // HSS path: `decode_multi_seq` calls the production
-                        // paged-decode kernel which reads K/V from HBM only
-                        // (`meta.block_table`). Under HSS, HBM is capped to
-                        // `cache_blocks_per_seq` blocks, so older context
-                        // lives only on disk and is unreachable from the
-                        // multi-Q kernel — Q/V attends only over the recent
-                        // ~cap×bs tokens, missing the long-context history.
-                        // The single-token `decode` path routes through the
-                        // HSS orchestrator (`attend_layer_on_stream`) which
-                        // reads the full history from disk. Fall back to
-                        // `decode_batched` (N sequential single-token
-                        // decodes via the orchestrator) at the cost of
-                        // ~k× attention launches per verify step. Mirrors
-                        // the SSM branch below which already uses
-                        // decode_batched for the same correctness reason.
+                for (layer_idx, layer) in self.layers.iter().enumerate() {
+                    let layer_type = self.config.layer_type(layer_idx);
+
+                    if layer_type == LayerType::FullAttention {
+                        if hss_engaged {
+                            // HSS path: `decode_multi_seq` calls the production
+                            // paged-decode kernel which reads K/V from HBM only
+                            // (`meta.block_table`). Under HSS, HBM is capped to
+                            // `cache_blocks_per_seq` blocks, so older context
+                            // lives only on disk and is unreachable from the
+                            // multi-Q kernel — Q/V attends only over the recent
+                            // ~cap×bs tokens, missing the long-context history.
+                            // The single-token `decode` path routes through the
+                            // HSS orchestrator (`attend_layer_on_stream`) which
+                            // reads the full history from disk. Fall back to
+                            // `decode_batched` (N sequential single-token
+                            // decodes via the orchestrator) at the cost of
+                            // ~k× attention launches per verify step. Mirrors
+                            // the SSM branch below which already uses
+                            // decode_batched for the same correctness reason.
+                            layer.decode_batched(
+                                hidden,
+                                residual,
+                                k,
+                                seq.layer_states[layer_idx].as_mut(),
+                                &mut kv_cache,
+                                seq.seq_len,
+                                &mut seq.block_table,
+                                &mut seq.disk_block_ids,
+                                &mut seq.disk_last_offloaded_per_layer,
+                                &ctx,
+                                stream,
+                            )?;
+                        } else {
+                            // Attention: the k tokens ride as k rows, but they are
+                            // k tokens of ONE sequence, not k sequences. Any
+                            // per-sequence aux state (the QSA indexer) must advance
+                            // once per row against THIS sequence's own state —
+                            // `row_owner` says so. Allocating a state per row, as
+                            // this did while attention was stateless, handed the
+                            // indexer an empty history (ingested=0 at pos>0).
+                            let mut seq_state_arr: [&mut (dyn LayerState + 'static); 1] =
+                                [seq.layer_states[layer_idx].as_mut()];
+                            let row_owner = vec![0usize; k];
+                            layer.decode_multi_seq_rows(
+                                hidden,
+                                residual,
+                                k,
+                                &mut seq_state_arr,
+                                &row_owner,
+                                &mut kv_cache,
+                                &seq_lens_vec,
+                                &block_tables_vec,
+                                &ctx,
+                                stream,
+                            )?;
+                        }
+                    } else {
+                        // SSM: process K=2 tokens for one sequence via decode_batched.
                         layer.decode_batched(
                             hidden,
                             residual,
@@ -382,88 +421,52 @@ impl TransformerModel {
                             &ctx,
                             stream,
                         )?;
-                    } else {
-                        // Attention: the k tokens ride as k rows, but they are
-                        // k tokens of ONE sequence, not k sequences. Any
-                        // per-sequence aux state (the QSA indexer) must advance
-                        // once per row against THIS sequence's own state —
-                        // `row_owner` says so. Allocating a state per row, as
-                        // this did while attention was stateless, handed the
-                        // indexer an empty history (ingested=0 at pos>0).
-                        let mut seq_state_arr: [&mut (dyn LayerState + 'static); 1] =
-                            [seq.layer_states[layer_idx].as_mut()];
-                        let row_owner = vec![0usize; k];
-                        layer.decode_multi_seq_rows(
-                            hidden,
-                            residual,
-                            k,
-                            &mut seq_state_arr,
-                            &row_owner,
-                            &mut kv_cache,
-                            &seq_lens_vec,
-                            &block_tables_vec,
-                            &ctx,
-                            stream,
-                        )?;
                     }
-                } else {
-                    // SSM: process K=2 tokens for one sequence via decode_batched.
-                    layer.decode_batched(
-                        hidden,
-                        residual,
-                        k,
-                        seq.layer_states[layer_idx].as_mut(),
-                        &mut kv_cache,
-                        seq.seq_len,
-                        &mut seq.block_table,
-                        &mut seq.disk_block_ids,
-                        &mut seq.disk_last_offloaded_per_layer,
-                        &ctx,
+                    // DFlash hidden capture for ctx conditioning. Capture from
+                    // the LAST verified position (K-1) — the bonus token in
+                    // K=2. This populates `dflash_hidden_save` so the next
+                    // `propose()` has fresh target hiddens. No-op when DFlash
+                    // is disabled.
+                    self.try_dflash_capture(layer_idx, k - 1, stream)?;
+                }
+
+                // Final norm [2, H]
+                let normed = self.buffers.norm_output();
+                self.final_norm_rows(hidden, normed, k as u32, stream)?;
+
+                // LM head for 2 tokens (GEMM: weights loaded once)
+                self.lm_head_batched(normed, k as u32, self.buffers.logits(), stream)?;
+
+                // Argmax inside graph (fixed scratch addresses — graph-safe)
+                let vocab = self.config.vocab_size;
+                let argmax_out = self.buffers.scratch();
+                for t in 0..k {
+                    let logits_t = self.buffers.logits().offset(t * vocab * bf16);
+                    let out_t = argmax_out.offset(t * 4);
+                    ops::argmax_bf16(
+                        self.gpu.as_ref(),
+                        self.argmax_kernel,
+                        logits_t,
+                        out_t,
+                        vocab as u32,
                         stream,
                     )?;
                 }
-                // DFlash hidden capture for ctx conditioning. Capture from
-                // the LAST verified position (K-1) — the bonus token in
-                // K=2. This populates `dflash_hidden_save` so the next
-                // `propose()` has fresh target hiddens. No-op when DFlash
-                // is disabled.
-                self.try_dflash_capture(layer_idx, k - 1, stream)?;
-            }
 
-            // Final norm [2, H]
-            let normed = self.buffers.norm_output();
-            self.final_norm_rows(hidden, normed, k as u32, stream)?;
-
-            // LM head for 2 tokens (GEMM: weights loaded once)
-            self.lm_head_batched(normed, k as u32, self.buffers.logits(), stream)?;
-
-            // Argmax inside graph (fixed scratch addresses — graph-safe)
-            let vocab = self.config.vocab_size;
-            let argmax_out = self.buffers.scratch();
-            for t in 0..k {
-                let logits_t = self.buffers.logits().offset(t * vocab * bf16);
-                let out_t = argmax_out.offset(t * 4);
-                ops::argmax_bf16(
-                    self.gpu.as_ref(),
-                    self.argmax_kernel,
-                    logits_t,
-                    out_t,
-                    vocab as u32,
-                    stream,
-                )?;
-            }
-
-            if use_graphs {
-                let graph = self.gpu.end_capture(stream)?;
-                if graph.0 != 0 {
-                    tracing::info!("Captured CUDA graph for K=2 verify (slot={})", seq.slot_idx);
-                    if let Some(ref mut cache) = graph_cache {
-                        cache.insert(seq.slot_idx, graph);
+                if use_graphs {
+                    let graph = self.gpu.end_capture(stream)?;
+                    if graph.0 != 0 {
+                        tracing::info!(
+                            "Captured CUDA graph for K=2 verify (slot={})",
+                            seq.slot_idx
+                        );
+                        if let Some(ref mut cache) = graph_cache {
+                            cache.insert(seq.slot_idx, graph);
+                        }
+                        self.gpu.launch_graph(graph, stream)?;
                     }
-                    self.gpu.launch_graph(graph, stream)?;
                 }
             }
-        }
         } // seg_graphs
 
         // ── Phase 3: Post-graph (D2H copy only) ──

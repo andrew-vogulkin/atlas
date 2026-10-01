@@ -44,7 +44,16 @@ pub(super) fn hc_pre_split(
         .launch(stream)?;
 
     hc_pre_split_rest(
-        gpu, w, y_out, inj_out, scratch, num_tokens, hidden_size, hc_mult, inject, stream,
+        gpu,
+        w,
+        y_out,
+        inj_out,
+        scratch,
+        num_tokens,
+        hidden_size,
+        hc_mult,
+        inject,
+        stream,
     )
 }
 
@@ -83,7 +92,16 @@ pub(super) fn hc_post_pre_split(
         .arg_f32(norm_eps)
         .launch(stream)?;
     hc_pre_split_rest(
-        gpu, w, y_out, inj_out, scratch, num_tokens, hidden_size, hc_mult, true, stream,
+        gpu,
+        w,
+        y_out,
+        inj_out,
+        scratch,
+        num_tokens,
+        hidden_size,
+        hc_mult,
+        true,
+        stream,
     )
 }
 

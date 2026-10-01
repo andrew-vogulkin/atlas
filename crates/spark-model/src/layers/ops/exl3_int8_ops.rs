@@ -279,9 +279,19 @@ pub fn exl3_int8_linear_bf16_rows(
     // padded tail; the fused epilogue's column-group completion order is not
     // fixed, so it could clobber row 1's first logits.
     let (xa, xb) = (x_bf16.0, x_bf16.0 + (m as u64 * kdim as u64) * 2);
-    let (oa, ob) = (out_bf16.0, out_bf16.0 + ((m as u64 - 1) * out_stride as u64 + n as u64) * 2);
+    let (oa, ob) = (
+        out_bf16.0,
+        out_bf16.0 + ((m as u64 - 1) * out_stride as u64 + n as u64) * 2,
+    );
     if (xa < ob && oa < xb) || (m > 1 && out_stride < n) {
-        super::exl3_ops::exl3_convert(gpu, k.bf16_to_f16, x_bf16, x_f16, (m as usize * kdim) as u32, stream)?;
+        super::exl3_ops::exl3_convert(
+            gpu,
+            k.bf16_to_f16,
+            x_bf16,
+            x_f16,
+            (m as usize * kdim) as u32,
+            stream,
+        )?;
         exl3_int8_gemv(gpu, k8, ws, x_f16, m, w, a_had, c_f32, grid, stream)?;
         return exl3_f32_to_bf16_rows(gpu, k8, c_f32, out_bf16, m, n, out_stride, stream);
     }

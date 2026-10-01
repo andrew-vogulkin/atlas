@@ -50,8 +50,8 @@ mod verify_d_serial;
 mod verify_e;
 pub(in crate::model) mod verify_e2;
 mod verify_fused;
-pub(in crate::model) mod verify_seg;
 mod verify_layer_trace;
+pub(in crate::model) mod verify_seg;
 
 impl Model for TransformerModel {
     fn lightning_dspark_product_policy(

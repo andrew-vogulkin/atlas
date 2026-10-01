@@ -52,7 +52,14 @@ pub(crate) fn verify_seg_graphs_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         let on = std::env::var("ATLAS_VERIFY_SEG_GRAPHS").ok().as_deref() != Some("0");
-        tracing::info!("segmented K=2 verify graphs: {}", if on { "ON" } else { "OFF (ATLAS_VERIFY_SEG_GRAPHS=0)" });
+        tracing::info!(
+            "segmented K=2 verify graphs: {}",
+            if on {
+                "ON"
+            } else {
+                "OFF (ATLAS_VERIFY_SEG_GRAPHS=0)"
+            }
+        );
         on
     })
 }

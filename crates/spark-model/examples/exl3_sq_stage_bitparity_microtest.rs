@@ -166,7 +166,10 @@ impl<'a> Rig<'a> {
         let g = self.g;
         let x = upload(
             g,
-            &x_bits.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
+            &x_bits
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<u8>>(),
         )?;
         let x_f16 = zeros(g, m as usize * k * 2)?;
         let a_had = zeros(g, m as usize * k * 2)?;
@@ -196,7 +199,10 @@ impl<'a> Rig<'a> {
         let g = self.g;
         let x = upload(
             g,
-            &x_bits.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
+            &x_bits
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<u8>>(),
         )?;
         let x_f16 = zeros(g, m as usize * k * 2)?;
         let a_had = zeros(g, m as usize * k * 2)?;
@@ -208,20 +214,8 @@ impl<'a> Rig<'a> {
         let out = upload(g, &sentinel)?;
         let stream = g.default_stream();
         exl3_int8_linear_bf16_rows(
-            g,
-            &self.k8,
-            &self.k,
-            &self.ws,
-            x,
-            m,
-            &c.dev,
-            x_f16,
-            a_had,
-            c_f32,
-            out,
-            out_stride,
-            self.grid,
-            stream,
+            g, &self.k8, &self.k, &self.ws, x, m, &c.dev, x_f16, a_had, c_f32, out, out_stride,
+            self.grid, stream,
         )?;
         g.synchronize(stream)?;
         let got = dl_u16(g, out, dest_elems)?;
@@ -299,7 +293,8 @@ fn main() -> Result<()> {
         let first: Vec<String> = y.iter().take(4).map(|w| format!("{:04x}", w)).collect();
         eprintln!(
             "  DIGEST k={k} n={n} b={bits} m=2: {h:016x} ({} words, {nz} nonzero, head {})",
-            y.len(), first.join(",")
+            y.len(),
+            first.join(",")
         );
     }
     {
@@ -326,7 +321,10 @@ fn main() -> Result<()> {
     }
 
     // ---- Leg C: lm_head `_rows` entry, out_stride < padded n ----
-    eprintln!("\n== leg C: lm_head _rows (out_stride {LM_HEAD_STRIDE} < n {}) ==", LM_HEAD.1);
+    eprintln!(
+        "\n== leg C: lm_head _rows (out_stride {LM_HEAD_STRIDE} < n {}) ==",
+        LM_HEAD.1
+    );
     {
         let (k, n, bits) = LM_HEAD;
         let c = random_case(&g, k, n, bits)?;

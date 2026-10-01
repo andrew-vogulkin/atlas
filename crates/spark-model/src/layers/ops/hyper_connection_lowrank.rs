@@ -488,9 +488,23 @@ pub fn hc_post_pre_lowrank(
     norm_eps: f32,
     stream: u64,
 ) -> Result<()> {
-    anyhow::ensure!(!w.inject_w.is_null(), "hc_post_pre_lowrank needs block_inject_weight");
+    anyhow::ensure!(
+        !w.inject_w.is_null(),
+        "hc_post_pre_lowrank needs block_inject_weight"
+    );
     hc_post_pre_split(
-        gpu, block_out, streams, inj, w, y_out, inj_out, scratch, num_tokens, hidden_size,
-        hc_mult, norm_eps, stream,
+        gpu,
+        block_out,
+        streams,
+        inj,
+        w,
+        y_out,
+        inj_out,
+        scratch,
+        num_tokens,
+        hidden_size,
+        hc_mult,
+        norm_eps,
+        stream,
     )
 }

@@ -217,12 +217,32 @@ pub fn hc_post_pre_site(
         );
     }
     hc_post_site(
-        gpu, post_kernel, hc, block_out, streams, post, comb, streams, num_tokens, hidden_size,
+        gpu,
+        post_kernel,
+        hc,
+        block_out,
+        streams,
+        post,
+        comb,
+        streams,
+        num_tokens,
+        hidden_size,
         stream,
     )?;
     hc_pre_site(
-        gpu, pre_kernel, streams, next, hc, y_out, post, comb, scratch, num_tokens, hidden_size,
-        norm_eps, stream,
+        gpu,
+        pre_kernel,
+        streams,
+        next,
+        hc,
+        y_out,
+        post,
+        comb,
+        scratch,
+        num_tokens,
+        hidden_size,
+        norm_eps,
+        stream,
     )
 }
 
