@@ -395,6 +395,14 @@ impl TransformerModel {
             self.verify2_graph.lock().drain().map(|(_, g)| g).collect(),
         );
         drain(
+            "verify_segment_graphs",
+            self.verify_segment_graphs
+                .lock()
+                .drain()
+                .flat_map(|(_, e)| e.into_handles())
+                .collect(),
+        );
+        drain(
             "verify3_graph",
             self.verify3_graph.lock().drain().map(|(_, g)| g).collect(),
         );

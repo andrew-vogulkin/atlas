@@ -354,6 +354,10 @@ impl TransformerModel {
         let stream = self.gpu.default_stream();
         self.ssm_pool
             .copy_slot(old_slot, new_slot, self.gpu.as_ref(), stream)?;
+        // Segmented verify graphs bake (slot pool pointers, occupant's PLE
+        // carry): after a migration neither slot's entry describes its next
+        // occupant. Drop both; the next verify on either slot re-captures.
+        self.drop_segment_graphs(&[old_slot, new_slot]);
 
         // Update ALL SsmLayerState pool pointers to point at the new slot.
         // BUG FIX: previously only h_state and conv_state were repointed, leaving

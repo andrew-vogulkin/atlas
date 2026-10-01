@@ -728,6 +728,7 @@ impl TransformerModel {
             dflash_hidden_save_nseq,
             dflash_capture_layers,
             verify2_graph: Mutex::new(std::collections::HashMap::new()),
+            verify_segment_graphs: Mutex::new(std::collections::HashMap::new()),
             verify3_graph: Mutex::new(std::collections::HashMap::new()),
             verify4_graph: Mutex::new(std::collections::HashMap::new()),
             verify_batched_graphs: Mutex::new((std::collections::HashMap::new(), 0)),

@@ -36,6 +36,11 @@ impl TransformerModel {
                 dead.push(g);
             }
         }
+        // Segmented K=2 verify graphs: bake the PLE carry of the occupant
+        // that is being freed, exactly like verify2_graph (R6 item 3 §3.5).
+        if let Some(e) = self.verify_segment_graphs.lock().remove(&slot) {
+            dead.extend(e.into_handles());
+        }
         // Composite keys are `(slot, k)` — drop every width for this slot.
         self.verify_kgamma_graph.lock().retain(|k, g| {
             if k.0 == slot {

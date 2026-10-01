@@ -132,6 +132,23 @@ pub trait TransformerLayer: Send + Sync {
         false
     }
 
+    /// Like [`Self::decode_graph_unsupported`], but for the single-sequence
+    /// K=2 verify path, which prestages every layer's host half
+    /// (`verify_prestage`) before any capture region. Consulted only by the
+    /// segmented verify capture (`verify_seg.rs`) for the layers it puts
+    /// inside a captured segment. Default: same answer as decode.
+    fn verify_graph_unsupported(&self) -> bool {
+        self.decode_graph_unsupported()
+    }
+
+    /// Host-side bookkeeping a REPLAYED verify segment must still perform for
+    /// this layer: the replay re-runs the kernels but not the Rust that ran
+    /// beside them at capture time. Must leave the layer state exactly as an
+    /// eager `decode_batched(k)` would have. Default: nothing to do.
+    fn verify_replay_host(&self, _state: &mut dyn LayerState, _k: usize) -> Result<()> {
+        Ok(())
+    }
+
     /// Marconi aux state: host-serialized per-layer SEQUENCE state that must
     /// travel with an SSM snapshot for a prefix-cache hit to be complete —
     /// PLE's n-gram history + conv state, QSA's ingested indexer keys.

@@ -357,6 +357,27 @@ impl TransformerLayer for Qwen3SsmLayer {
         self.ple.is_some()
     }
 
+    /// The K=2 verify prestages PLE's host half for every layer before any
+    /// capture region, so the reason for the decode veto does not apply.
+    fn verify_graph_unsupported(&self) -> bool {
+        false
+    }
+
+    fn verify_replay_host(&self, state: &mut dyn LayerState, k: usize) -> Result<()> {
+        if let Some(ple) = self.ple.as_ref() {
+            let ssm = state
+                .as_any_mut()
+                .downcast_mut::<crate::layer::SsmLayerState>()
+                .ok_or_else(|| anyhow::anyhow!("PLE host layer state is not SsmLayerState"))?;
+            let st = ssm
+                .ple
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("PLE verify replay before prefill: no seq state"))?;
+            ple.replay_bookkeeping(st, k)?;
+        }
+        Ok(())
+    }
+
     fn snapshot_aux(
         &self,
         state: &dyn LayerState,
