@@ -244,6 +244,25 @@ impl ModelWeightLoader for Qwen35WeightLoader {
             fc2_b: vision_tensor_dense_auto(store, &format!("{mp}.linear_fc2.bias"), gpu)?.weight,
         };
 
+        // The MLP width the weights ACTUALLY have. EXL3 pads every linear to a
+        // multiple of 128 (4304 -> 4352): fc1 gains zero rows (zero weight,
+        // zero bias, so gelu(0) = 0 in the pad) and fc2 gains matching input
+        // columns. Driving the GEMMs with the configs 4304 then reads fc2s
+        // [1152, 4352] rows with a 4304 stride and the ViT output is garbage.
+        // Using the stored row count is exact for both padded and unpadded
+        // checkpoints.
+        let vit_inter = store
+            .get(&format!("{vp}.blocks.0.mlp.linear_fc1.weight"))?
+            .shape
+            .first()
+            .copied()
+            .unwrap_or(vcfg.intermediate_size);
+        if vit_inter != vcfg.intermediate_size {
+            tracing::info!(
+                "vision MLP: stored width {vit_inter} != config intermediate_size {} (quant padding); using stored width",
+                vcfg.intermediate_size
+            );
+        }
         let deepstack_indexes = vcfg.deepstack_visual_indexes.clone();
         let ve = crate::layers::VisionEncoder::new(
             patch_embed_w.weight,
@@ -258,7 +277,7 @@ impl ModelWeightLoader for Qwen35WeightLoader {
             vcfg.num_heads,
             vcfg.spatial_merge_size,
             vcfg.out_hidden_size,
-            vcfg.intermediate_size,
+            vit_inter,
             vcfg.patch_size,
             vcfg.max_pixels,
             gpu,
